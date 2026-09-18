@@ -9,8 +9,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ## Gran Turismo 7 — Boot Progress
 
-Captured on this branch, in order, from first present through the opening wizard
-to the car carousel.
+Audio seems to work fine and you can hear it get in game but that's as far as it got
 
 |                                         |                                            |
 | :-------------------------------------: | :----------------------------------------: |
