@@ -10,6 +10,7 @@ public static class HostWindowInput
 {
     private static readonly object Gate = new();
     private static readonly HashSet<int> PressedKeys = new();
+    private static readonly Dictionary<int, long> ReleaseHoldUntilMs = new();
     private static bool _focused;
     private static bool _gamepadConnected;
     private static string? _gamepadName;
@@ -24,6 +25,7 @@ public static class HostWindowInput
             _focused = true;
             _gamepadOutput = gamepadOutput;
             PressedKeys.Clear();
+            ReleaseHoldUntilMs.Clear();
         }
 
         HostWindowInputSource.Set(Source);
@@ -39,6 +41,7 @@ public static class HostWindowInput
             _gamepadState = default;
             _gamepadOutput = null;
             PressedKeys.Clear();
+            ReleaseHoldUntilMs.Clear();
         }
 
         HostWindowInputSource.Clear(Source);
@@ -52,9 +55,20 @@ public static class HostWindowInput
             if (!focused)
             {
                 PressedKeys.Clear();
+                ReleaseHoldUntilMs.Clear();
             }
         }
     }
+
+    // SDL events are drained in one loop before each frame, so a key pressed
+    // and released between two drains is added and removed here back to back
+    // and the guest, which samples the pad once a frame, never sees it. Real
+    // hardware cannot lose a tap that way. Keep a released key visible for a
+    // short window measured from its press so at least one guest sample
+    // observes it.
+    // ponytail: fixed window; latch until a sample has consumed the key if a
+    // title ever polls slower than MinimumVisiblePressMs.
+    private const long MinimumVisiblePressMs = 100;
 
     public static void SetKey(int virtualKey, bool down)
     {
@@ -63,12 +77,35 @@ public static class HostWindowInput
             if (down)
             {
                 PressedKeys.Add(virtualKey);
+                ReleaseHoldUntilMs.Remove(virtualKey);
             }
-            else
+            else if (PressedKeys.Remove(virtualKey))
             {
-                PressedKeys.Remove(virtualKey);
+                ReleaseHoldUntilMs[virtualKey] =
+                    Environment.TickCount64 + MinimumVisiblePressMs;
             }
         }
+    }
+
+    private static bool IsKeyDownLocked(int virtualKey)
+    {
+        if (PressedKeys.Contains(virtualKey))
+        {
+            return true;
+        }
+
+        if (!ReleaseHoldUntilMs.TryGetValue(virtualKey, out var holdUntil))
+        {
+            return false;
+        }
+
+        if (Environment.TickCount64 < holdUntil)
+        {
+            return true;
+        }
+
+        ReleaseHoldUntilMs.Remove(virtualKey);
+        return false;
     }
 
     public static void SetGamepad(string? name, HostGamepadState state)
@@ -117,7 +154,7 @@ public static class HostWindowInput
         {
             lock (Gate)
             {
-                return PressedKeys.Contains(virtualKey);
+                return IsKeyDownLocked(virtualKey);
             }
         }
 

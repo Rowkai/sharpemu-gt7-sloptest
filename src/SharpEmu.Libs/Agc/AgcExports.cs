@@ -1177,6 +1177,8 @@ public static partial class AgcExports
     private const int RegisterDefaultsSize = 0x40;
     private const int RegisterDefaultBlockSize = 16 * 8;
 
+    // SceKernelEvent: ident at +0x00, filter (int16) at +0x08.
+    private const ulong KernelEventFilterFieldOffset = 0x08;
     private const ulong ShaderUserDataOffset = 0x08;
     private const ulong ShaderCodeOffset = 0x10;
     private const ulong ShaderCxRegistersOffset = 0x18;
@@ -1278,6 +1280,16 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FRAME_PACKETS"),
         "1",
         StringComparison.Ordinal);
+    // Label writes only (release_mem, write_data, rewind patch): which queue and
+    // submission schedules a write to which label. With the existing per-label
+    // agc.wait_suspended warning this shows a cross-queue wait cycle without the
+    // full packet trace, which slows a title enough to change the ordering.
+    private static readonly bool _traceAgcLabels =
+        _traceAgc ||
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_LABELS"),
+            "1",
+            StringComparison.Ordinal);
     private static readonly bool _traceVertexRanges = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VERTEX_RANGES"),
         "1",
@@ -2435,7 +2447,9 @@ public static partial class AgcExports
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var dwordCount = (uint)ctx[CpuRegister.Rsi];
-        if (commandBufferAddress == 0 || dwordCount < 2 || dwordCount > 0x4001)
+        // 0x4000 dwords is the largest NOP a type-3 header can express: one more
+        // would encode COUNT 0x3FFF, which the CP reads as an empty packet.
+        if (commandBufferAddress == 0 || dwordCount < 2 || dwordCount > 0x4000)
         {
             return ReturnPointer(ctx, 0);
         }
@@ -4363,6 +4377,41 @@ public static partial class AgcExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    /// <summary>
+    /// Classifies an AGC driver event taken off an event queue. The value is the
+    /// event id the driver published for that completion, which is the same id
+    /// <c>sceAgcDriverAddEqEvent</c> registered: graphics end-of-pipe keeps id 0,
+    /// and a compute queue uses <c>((pipe + 4) &lt;&lt; 3) | queue</c>. Titles
+    /// branch on it to tell a graphics completion from a compute one, so leaving
+    /// it unresolved does not merely lose information — the unresolved sentinel
+    /// reads as a compute queue and the graphics completion is dropped.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "5CdQTZIQPxM",
+        ExportName = "sceAgcDriverGetEqEventType",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqEventType(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0 ||
+            !TryReadUInt64(ctx, eventAddress, out var ident) ||
+            !TryReadUInt32(ctx, eventAddress + KernelEventFilterFieldOffset, out var filterField))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var filter = unchecked((short)(filterField & 0xFFFF));
+        if (filter != KernelEventQueueCompatExports.KernelEventFilterGraphics)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TraceAgc($"agc.driver_get_eq_event_type ev=0x{eventAddress:X16} id=0x{ident:X}");
+        ctx[CpuRegister.Rax] = ident;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",
@@ -4724,6 +4773,15 @@ public static partial class AgcExports
         // ThreadPool hop, either of which can only make the interrupt late and
         // reorder it against registration changes (and can wake Unity while its
         // upload data is still stale).
+        //
+        // The queue identity is the ambient scope ParseSubmittedDcb enters, and
+        // every caller reaches here after that scope has been disposed. Without
+        // re-entering it the action lands on the default host queue: it is then
+        // neither ordered behind this queue's work nor checked against this
+        // queue's fence, so the interrupt can fire before the work it reports.
+        using var completionQueueScope = GuestGpu.Current.EnterGuestQueue(
+            queueName,
+            submissionId);
         if (GuestGpu.Current.SubmitOrderedGuestAction(
                 TriggerCompletionEvents,
                 $"agc submit completion {submissionId}") == 0)
@@ -5763,6 +5821,14 @@ public static partial class AgcExports
             }
 
             _labelProducers.Add(producer);
+        }
+
+        if (_traceAgcLabels)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.label_producer queue={producer.QueueName} " +
+                $"submission={producer.SubmissionId} dst=0x{address:X16} len={length} " +
+                $"packet=0x{packetAddress:X16} seq={producer.Sequence} action='{debugName}'");
         }
 
         if (_traceAgc)
@@ -7674,23 +7740,23 @@ public static partial class AgcExports
                         "release_mem_standard", destinationAddress, data, dataSelection);
                 }
 
-                // Only deliver a kevent when int_sel requests one — the
-                // driver's completion refcount signals on an exact zero
-                // crossing, and an unrequested kevent drives it negative and
-                // permanently loses the frame-graph kick.
-                var wokenQueues = interruptSelection != 0
-                    ? KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
-                        KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                        data)
-                    : 0;
-
+                // An interrupt-flagged RELEASE_MEM does not become an event
+                // queue entry by itself. The registered AGC driver event is a
+                // submission-completion notification, which
+                // NotifySubmittedDcbCompleted raises once the whole submission
+                // reaches end-of-pipe; delivering here as well reports one
+                // submission several times, once per intra-submission fence.
+                // Titles size their bookkeeping to the driver's contract, so
+                // the extra notifications are not harmless noise: GT7 hands the
+                // pump a context pointer per notification and faults on the
+                // spare ones.
                 if (tracePacket)
                 {
                     TraceAgc(
                         $"agc.dcb.release_mem_standard dst_sel={destination} " +
                         $"dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
                         $"data=0x{data:X16} wrote={wroteData} " +
-                        $"int={interruptSelection} woken={wokenQueues}");
+                        $"int={interruptSelection} woken=0");
                 }
             },
             $"release_mem_standard dst=0x{destinationAddress:X16} data=0x{data:X16}",
@@ -7797,19 +7863,12 @@ public static partial class AgcExports
                     ReportLabelWriteFailure("release_mem", destinationAddress, data, dataSelection);
                 }
 
-                // Same interrupt gating as the standard form above.
-                var wokenQueues = interrupt != 0
-                    ? KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
-                        KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                        data)
-                    : 0;
-
                 if (tracePacket)
                 {
                     TraceAgc(
                         $"agc.dcb.release_mem dst=0x{destinationAddress:X16} " +
                         $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData} " +
-                        $"int={interrupt} woken={wokenQueues}");
+                        $"int={interrupt} woken=0");
                 }
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
@@ -8583,8 +8642,13 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
             // which reads pooled buffer data the presenter may already have
             // recycled (harmless for diagnostics, garbage bytes at worst) —
             // cost nothing in normal runs.
-            if (_traceAgcShader)
+            var movieDraw = _traceMovieTextureBase != 0 &&
+                translatedDraw.Textures.Any(t => t.Descriptor.Address - _traceMovieTextureBase < 0x4000000UL);
+            if (_traceAgcShader || movieDraw)
             {
+                _forceAgcShaderTrace = movieDraw;
+                try
+                {
                 lock (_submitTraceGate)
                 {
                     var firstTextureAddress = translatedDraw.Textures.FirstOrDefault()?.Descriptor.Address ?? 0;
@@ -8599,6 +8663,11 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                             psInputEna,
                             psInputAddr);
                     }
+                }
+                }
+                finally
+                {
+                    _forceAgcShaderTrace = false;
                 }
             }
 
@@ -10948,6 +11017,20 @@ private static long _indirectDrawProbeCount;
     {
         var textures = new List<GuestDrawTexture>(bindings.Count);
         fallbackTextureCount = 0;
+        if (_traceMovieTextureBase != 0 &&
+            bindings.Any(b => b.Descriptor.Address - _traceMovieTextureBase < 0x4000000UL) &&
+            Interlocked.Increment(ref _movieBindGroupTraceCount) <= 64)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.movie_bind_group count=" + bindings.Count + " [" +
+                string.Join(
+                    ", ",
+                    bindings.Select(b =>
+                        $"0x{b.Descriptor.Address:X16}:{b.Descriptor.Width}x{b.Descriptor.Height}" +
+                        $":fmt{b.Descriptor.Format}/num{b.Descriptor.NumberType}/tile{b.Descriptor.TileMode}" +
+                        $"/storage{(b.IsStorage ? 1 : 0)}/mip{b.MipLevel}/arr{(b.IsArrayed ? 1 : 0)}")) +
+                "]");
+        }
         foreach (var binding in bindings)
         {
             if (TryCreateGuestDrawTexture(
@@ -11471,6 +11554,101 @@ private static long _indirectDrawProbeCount;
             $"dst=0x{descriptor.DstSelect:X3}");
     }
 
+    // SHARPEMU_TRACE_TEXTURE_BIND_ADDRESS=<hex>: log texture binds whose address
+    // lies in the MiB above it, and which upload path each one took.
+    private static readonly ulong _traceTextureBindAddress = ulong.TryParse(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TEXTURE_BIND_ADDRESS")?
+            .Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase),
+        System.Globalization.NumberStyles.HexNumber,
+        System.Globalization.CultureInfo.InvariantCulture,
+        out var traceTextureBindAddress)
+            ? traceTextureBindAddress
+            : 0;
+
+    private static int _textureBindTraceCount;
+
+    private static long _textureBindTotal;
+
+    private static int _videoBufferBindTraceCount;
+
+    private static readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _largeTextureBindsSeen = new();
+
+    // SHARPEMU_TRACE_MOVIE_TEXTURE=<hex>: base of a title's decoded-video ring.
+    // Logs the complete image-binding group of any draw or dispatch that binds
+    // a texture within 64 MiB of it, so a bad sibling descriptor is visible.
+    private static readonly ulong _traceMovieTextureBase = ParseOptionalHexAddress(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_MOVIE_TEXTURE")) ?? 0;
+
+    private static int _movieBindGroupTraceCount;
+
+    // Set around one draw so the existing shader-draw trace prints for it only.
+    [ThreadStatic]
+    private static bool _forceAgcShaderTrace;
+
+    private static void TraceTextureBind(TextureDescriptor descriptor, bool isStorage, string path)
+    {
+        // SHARPEMU_TRACE_AVPLAYER_IMAGES=1: log every bind inside any registered
+        // AvPlayer frame buffer (all buffers, both NV12 planes), plus a periodic
+        // summary of all binds as a positive control that the hook is live.
+        if (AvPlayer.AvPlayerExports.ShouldTraceVideoBufferAddress(descriptor.Address))
+        {
+            if (Interlocked.Increment(ref _videoBufferBindTraceCount) <= 512)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.video_buffer_bind path={path} " +
+                    $"addr=0x{descriptor.Address:X16} type={descriptor.Type} " +
+                    $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
+                    $"fmt={descriptor.Format} num={descriptor.NumberType} " +
+                    $"tile={descriptor.TileMode} storage={isStorage}");
+            }
+        }
+        else if (path == "bind" &&
+                 Interlocked.Increment(ref _textureBindTotal) % 5000 == 0 &&
+                 Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AVPLAYER_IMAGES") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.texture_bind_summary binds={Interlocked.Read(ref _textureBindTotal)} " +
+                $"video_buffer_binds={Volatile.Read(ref _videoBufferBindTraceCount)} " +
+                $"sample=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} fmt={descriptor.Format}");
+        }
+
+        // Titles may copy decoded frames into their own memory before
+        // sampling, so also inventory every distinct large texture bound.
+        if (path == "bind" &&
+            descriptor.Width >= 1920 &&
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AVPLAYER_IMAGES") == "1")
+        {
+            bool first;
+            lock (_largeTextureBindsSeen)
+            {
+                first = _largeTextureBindsSeen.Count < 256 &&
+                    _largeTextureBindsSeen.Add((descriptor.Address, descriptor.Width, descriptor.Height, descriptor.Format));
+            }
+            if (first)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.large_texture_bind addr=0x{descriptor.Address:X16} " +
+                    $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
+                    $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
+                    $"storage={isStorage} after_binds={Interlocked.Read(ref _textureBindTotal)}");
+            }
+        }
+
+        if (_traceTextureBindAddress == 0 ||
+            descriptor.Address - _traceTextureBindAddress >= 0x100000 ||
+            Interlocked.Increment(ref _textureBindTraceCount) > 256)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.texture_bind path={path} " +
+            $"addr=0x{descriptor.Address:X16} type={descriptor.Type} " +
+            $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
+            $"fmt={descriptor.Format} num={descriptor.NumberType} " +
+            $"tile={descriptor.TileMode} storage={isStorage}");
+    }
+
     private static bool TryCreateGuestDrawTexture(
         CpuContext ctx,
         TextureDescriptor descriptor,
@@ -11480,6 +11658,7 @@ private static long _indirectDrawProbeCount;
         bool isArrayed,
         out GuestDrawTexture texture)
     {
+        TraceTextureBind(descriptor, isStorage, "bind");
         texture = default!;
         var textureDepth = GetTextureVolumeDepth(
             descriptor.Type,
@@ -11636,6 +11815,7 @@ private static long _indirectDrawProbeCount;
                 descriptor.Format,
                 descriptor.NumberType))
         {
+            TraceTextureBind(descriptor, isStorage, "upload-known-skip");
             NoteSampledAddress(descriptor.Address, descriptor.Format, descriptor.NumberType);
             texture = new GuestDrawTexture(
                 descriptor.Address,
@@ -11777,6 +11957,7 @@ private static long _indirectDrawProbeCount;
                     descriptor.Type,
                     textureDepth)))
         {
+            TraceTextureBind(descriptor, isStorage, "content-cached-skip");
             NoteSampledAddress(descriptor.Address, descriptor.Format, descriptor.NumberType);
             texture = new GuestDrawTexture(
                 descriptor.Address,
@@ -14634,28 +14815,25 @@ GuestImageWriteTracker.Track(
                 out var foundHi))
         {
             TryReadUInt32(ctx, shRegistersAddress, out var firstLo);
-            // GTA V Enhanced HS headers start at RSRC1/RSRC2 (0x10A/0x10B) and
-            // omit PGM_LO/HI from the default table. Still succeed: the code VA
-            // lives at ShaderCodeOffset and later binder paths republish it.
-            // GS front headers can likewise start at RSRC1_GS (0x8A) instead of
-            // PGM_LO_GS (0x88) - same deal, skip the patch here.
-            if ((shaderType == HsFrontShaderType && firstLo is SpiShaderPgmRsrc1Hs or SpiShaderPgmLoHs) ||
-                (shaderType == GsFrontShaderType && firstLo is SpiShaderPgmRsrc1Gs or SpiShaderPgmLoGs))
-            {
-                TraceCreateShader(
-                    0,
-                    headerAddress,
-                    codeAddress,
-                    $"skip-pgm-patch type={shaderType} first_lo=0x{firstLo:X8}");
-                return true;
-            }
 
+            // A default table without a PGM_LO/HI pair is normal, not malformed:
+            // GTA V Enhanced HS headers start at RSRC1/RSRC2 and omit the pair,
+            // GS front headers start at RSRC1_GS, and GT7 ships a stage this
+            // tree has no mapping for at all. The header has already been
+            // validated and relocated and the code VA has already been published
+            // at ShaderCodeOffset, so there is nothing left to reject: the
+            // program address reaches the GPU through the binder instead.
+            //
+            // Failing here is actively harmful rather than merely incomplete.
+            // Titles flag a shader as created before the call and never retry,
+            // so one rejection loses that shader for the run.
             TraceCreateShader(
                 0,
                 headerAddress,
                 codeAddress,
-                $"unexpected-registers type={shaderType} expected_lo=0x{expectedLo:X8} first_lo=0x{firstLo:X8}");
-            return false;
+                $"skip-pgm-patch type={shaderType} expected_lo=0x{expectedLo:X8} " +
+                $"first_lo=0x{firstLo:X8} count={registerCount}");
+            return true;
         }
 
         var loValue = (uint)((codeAddress >> 8) & 0xFFFF_FFFFUL);
@@ -15330,8 +15508,16 @@ GuestImageWriteTracker.Track(
         ((operation & 0x6u) << 5) |
         ((cachePolicy & 0x3u) << 25);
 
+    // COUNT is body-dwords-minus-one in a 14-bit field, so the length the CP
+    // derives from it wraps: COUNT 0x3FFF means a zero-dword body, not 16384.
+    // AGC uses that encoding as a no-payload/padding marker — GT7 ends every
+    // graphics submission with 0xFFFF1000 (NOP, COUNT 0x3FFF) ahead of the
+    // REWIND and INDIRECT_BUFFER tail that carries the frame — so reading it as
+    // a 16385-dword packet overruns the submission and abandons the rest of the
+    // frame. sceAgcGetDataPacketPayloadAddress above already treats COUNT
+    // 0x3FFF as "no payload"; this makes the parser agree.
     private static uint Pm4Length(uint header) =>
-        ((header >> 16) & 0x3FFFu) + 2u;
+        (((((header >> 16) & 0x3FFFu) + 1u) & 0x3FFFu) + 1u);
 
     private static bool TryReadByte(CpuContext ctx, ulong address, out byte value)
     {
@@ -15606,7 +15792,7 @@ GuestImageWriteTracker.Track(
 
         public AgcShaderTraceHandler(int literalLength, int formattedCount, out bool shouldAppend)
         {
-            _enabled = _traceAgcShader;
+            _enabled = _traceAgcShader || _forceAgcShaderTrace;
             shouldAppend = _enabled;
             _inner = _enabled
                 ? new System.Runtime.CompilerServices.DefaultInterpolatedStringHandler(literalLength, formattedCount)
@@ -15650,7 +15836,7 @@ GuestImageWriteTracker.Track(
     private static void TraceAgcShader(
         [System.Runtime.CompilerServices.InterpolatedStringHandlerArgument] ref AgcShaderTraceHandler message)
     {
-        if (_traceAgcShader)
+        if (_traceAgcShader || _forceAgcShaderTrace)
         {
             Console.Error.WriteLine($"[LOADER][TRACE] t={TraceSeconds()} {message.ToStringAndClear()}");
         }
@@ -15658,7 +15844,7 @@ GuestImageWriteTracker.Track(
 
     private static void TraceAgcShader(string message)
     {
-        if (!_traceAgcShader)
+        if (!_traceAgcShader && !_forceAgcShaderTrace)
         {
             return;
         }
@@ -15871,6 +16057,30 @@ GuestImageWriteTracker.Track(
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    // The ACB variants of the rewind gate. IT_REWIND is a CP packet rather than
+    // a graphics-ring one, so the async compute buffer encodes it exactly as the
+    // DCB does and the submit parser suspends on either. Callers keep the
+    // returned packet pointer and release the gate later through
+    // sceAgcAsyncRewindPatchSetRewindState.
+    //
+    // The ACB entry point takes a third argument the DCB one does not. Every
+    // observed call passes zero for it, so its meaning is unconfirmed and it is
+    // ignored here rather than guessed at.
+    [SysAbiExport(
+        Nid = "DwICrVxerkY",
+        ExportName = "sceAgcAcbRewind",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbRewind(CpuContext ctx) => DcbRewind(ctx);
+
+    [SysAbiExport(
+        Nid = "eWaWyFegzgQ",
+        ExportName = "sceAgcAsyncRewindPatchSetRewindState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AsyncRewindPatchSetRewindState(CpuContext ctx) =>
+        RewindPatchSetRewindState(ctx);
 
     // Matches the 4-dword INDIRECT_BUFFER packet DcbJump writes below.
     // Returning NOT_FOUND here left callers with a null packet pointer and an

@@ -686,6 +686,13 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 2));
                     break;
                 }
+                case "VXadU32":
+                    result = IAdd(
+                        BitwiseXor(
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
                 case "VAndOrB32":
                     result = BitwiseOr(
                         BitwiseAnd(

@@ -165,6 +165,63 @@ public sealed class KernelEventQueueCompatExportsTests
         Assert.Equal(0UL, BinaryPrimitives.ReadUInt64LittleEndian(evt[0x10..]));
     }
 
+    [Fact]
+    public void AddAmprEvent_WaitDeliversGt7AmprFilter()
+    {
+        const ulong eventIdent = 0x42;
+        var handle = CreateEqueue();
+        try
+        {
+            var (addContext, _) = NewContextWithOutSlot();
+            addContext[CpuRegister.Rdi] = handle;
+            addContext[CpuRegister.Rsi] = eventIdent;
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                KernelEventQueueCompatExports.KernelAddAmprEvent(addContext));
+
+            Assert.True(KernelEventQueueCompatExports.EnqueueEvent(
+                handle,
+                new KernelEventQueueCompatExports.KernelQueuedEvent(
+                    eventIdent,
+                    KernelEventQueueCompatExports.KernelEventFilterAmpr,
+                    KernelEventQueueCompatExports.KernelEventFlagClear,
+                    0,
+                    0,
+                    0)));
+
+            var memory = new FakeCpuMemory(MemoryBase, MemorySize);
+            var waitContext = new CpuContext(memory, Generation.Gen5);
+            const ulong eventsAddress = MemoryBase + 0x100;
+            const ulong outCountAddress = MemoryBase + 0x300;
+            const ulong timeoutAddress = MemoryBase + 0x380;
+            Assert.True(waitContext.TryWriteUInt32(timeoutAddress, 0));
+            waitContext[CpuRegister.Rdi] = handle;
+            waitContext[CpuRegister.Rsi] = eventsAddress;
+            waitContext[CpuRegister.Rdx] = 1;
+            waitContext[CpuRegister.Rcx] = outCountAddress;
+            waitContext[CpuRegister.R8] = timeoutAddress;
+
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                KernelEventQueueCompatExports.KernelWaitEqueue(waitContext));
+            Assert.True(waitContext.TryReadUInt32(outCountAddress, out var delivered));
+            Assert.Equal(1u, delivered);
+
+            Span<byte> evt = stackalloc byte[0x20];
+            Assert.True(memory.TryRead(eventsAddress, evt));
+            Assert.Equal(eventIdent, BinaryPrimitives.ReadUInt64LittleEndian(evt));
+            Assert.Equal(-25, BinaryPrimitives.ReadInt16LittleEndian(evt[0x08..]));
+        }
+        finally
+        {
+            var (deleteContext, _) = NewContextWithOutSlot();
+            deleteContext[CpuRegister.Rdi] = handle;
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                KernelEventQueueCompatExports.KernelDeleteEqueue(deleteContext));
+        }
+    }
+
     private static ulong CreateEqueue()
     {
         var memory = new FakeCpuMemory(MemoryBase, MemorySize);

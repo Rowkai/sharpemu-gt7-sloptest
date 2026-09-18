@@ -121,6 +121,11 @@ public static class KernelSemaphoreCompatExports
                     _ = TryWriteUInt32(ctx, timeoutAddress, timeoutUsec);
                 }
 
+                if (SyncTraceRing.TracesSemaphore(handle))
+                {
+                    SyncTraceRing.Record(SyncTraceRing.SyncEvent.SemaWaitFast, handle, (ulong)(uint)needCount, (ulong)(uint)semaphore.Count);
+                }
+
                 if (_traceSema)
                 {
                     TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)}");
@@ -129,6 +134,10 @@ public static class KernelSemaphoreCompatExports
             }
 
             semaphore.WaitingThreads++;
+            if (SyncTraceRing.TracesSemaphore(handle))
+            {
+                SyncTraceRing.Record(SyncTraceRing.SyncEvent.SemaWaitBlock, handle, (ulong)(uint)needCount, ((ulong)(uint)semaphore.Count << 32) | (uint)semaphore.WaitingThreads);
+            }
         }
 
         // Block cooperatively: the wake predicate atomically acquires the
@@ -143,7 +152,13 @@ public static class KernelSemaphoreCompatExports
         {
             lock (semaphore.Gate)
             {
-                if (semaphore.Count >= needCount)
+                var satisfied = semaphore.Count >= needCount;
+                if (SyncTraceRing.TracesSemaphore(handle))
+                {
+                    SyncTraceRing.Record(SyncTraceRing.SyncEvent.SemaPredicate, handle, (ulong)(uint)semaphore.Count, satisfied ? 1UL : 0UL);
+                }
+
+                if (satisfied)
                 {
                     semaphore.Count -= needCount;
                     semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
@@ -157,6 +172,11 @@ public static class KernelSemaphoreCompatExports
 
         int ResumeWait()
         {
+            if (SyncTraceRing.TracesSemaphore(handle))
+            {
+                SyncTraceRing.Record(SyncTraceRing.SyncEvent.SemaResume, handle, acquired ? 1UL : 0UL, (ulong)(uint)semaphore.Count);
+            }
+
             if (timeoutAddress != 0)
             {
                 _ = TryWriteUInt32(ctx, timeoutAddress, 0);
@@ -328,6 +348,9 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        var countBeforeSignal = 0;
+        var countAfterSignal = 0;
+        var waitersAtSignal = 0;
         lock (semaphore.Gate)
         {
             if (semaphore.Count > semaphore.MaxCount - signalCount)
@@ -335,7 +358,10 @@ public static class KernelSemaphoreCompatExports
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
             }
 
+            countBeforeSignal = semaphore.Count;
             semaphore.Count += signalCount;
+            countAfterSignal = semaphore.Count;
+            waitersAtSignal = semaphore.WaitingThreads;
             // Wake host-thread waiters parked in the fallback path.
             Monitor.PulseAll(semaphore.Gate);
             if (_traceSema)
@@ -346,7 +372,16 @@ public static class KernelSemaphoreCompatExports
 
         // Wake cooperatively-blocked guest threads; their wake predicate
         // acquires the tokens atomically, so this respects the new count.
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        var wokenThreads = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle)) ?? 0;
+        if (SyncTraceRing.TracesSemaphore(handle))
+        {
+            SyncTraceRing.Record(
+                SyncTraceRing.SyncEvent.SemaSignal,
+                handle,
+                ((ulong)(uint)countBeforeSignal << 32) | (uint)countAfterSignal,
+                ((ulong)(uint)waitersAtSignal << 32) | (uint)wokenThreads);
+        }
+
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 

@@ -280,6 +280,8 @@ public static partial class Gen5MslTranslator
                 "VXorB32" => $"(({RawSource(instruction, 0)}) ^ ({RawSource(instruction, 1)}))",
                 "VXnorB32" => $"~(({RawSource(instruction, 0)}) ^ ({RawSource(instruction, 1)}))",
                 "VNotB32" => $"~({RawSource(instruction, 0)})",
+                "VXadU32" =>
+                    $"((({RawSource(instruction, 0)}) ^ ({RawSource(instruction, 1)})) + ({RawSource(instruction, 2)}))",
                 "VAndOrB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | ({RawSource(instruction, 2)}))",
                 "VOr3U32" =>

@@ -286,9 +286,11 @@ public static partial class Gen5SpirvTranslator
         private uint _ldsElementPointer;
         private uint _ldsDwordMask;
         private uint _positionOutput;
+        private uint _clipDistanceOutput;
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
         private uint _fragCoordInput;
+        private uint _frontFacingInput;
         private uint _localInvocationIdInput;
         private uint _localInvocationIndexInput;
         private uint _workGroupIdInput;
@@ -1217,6 +1219,22 @@ public static partial class Gen5SpirvTranslator
                     (uint)SpirvBuiltIn.Position);
                 _interfaces.Add(_positionOutput);
 
+                // Guest vertex programs export (0,0,0,0) for vertices the
+                // hardware drops before the perspective divide. Vulkan has no
+                // such rule and divides by zero instead, so the primitive is
+                // culled through a clip distance written in EmitExport.
+                _module.AddCapability(SpirvCapability.ClipDistance);
+                _clipDistanceOutput = _module.AddGlobalVariable(
+                    _module.TypePointer(
+                        SpirvStorageClass.Output,
+                        _module.TypeArray(_floatType, 1)),
+                    SpirvStorageClass.Output);
+                _module.AddDecoration(
+                    _clipDistanceOutput,
+                    SpirvDecoration.BuiltIn,
+                    (uint)SpirvBuiltIn.ClipDistance);
+                _interfaces.Add(_clipDistanceOutput);
+
                 var parameters = _state.Program.Instructions
                     .Select(instruction => instruction.Control)
                     .OfType<Gen5ExportControl>()
@@ -1282,6 +1300,18 @@ public static partial class Gen5SpirvTranslator
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.FragCoord);
                 _interfaces.Add(_fragCoordInput);
+
+                if ((_pixelInputEnable & (1u << 12)) != 0)
+                {
+                    _frontFacingInput = _module.AddGlobalVariable(
+                        _module.TypePointer(SpirvStorageClass.Input, _boolType),
+                        SpirvStorageClass.Input);
+                    _module.AddDecoration(
+                        _frontFacingInput,
+                        SpirvDecoration.BuiltIn,
+                        (uint)SpirvBuiltIn.FrontFacing);
+                    _interfaces.Add(_frontFacingInput);
+                }
 
                 var declaredPixelOutputs =
                     Environment.GetEnvironmentVariable(
@@ -1460,6 +1490,18 @@ public static partial class Gen5SpirvTranslator
                 StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
                 StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
 
+                // A declared clip distance the shader never writes is undefined,
+                // and a program that exports no position would then cull at
+                // random. Keep the vertex visible until a position export says
+                // otherwise.
+                Store(
+                    _module.AddInstruction(
+                        SpirvOp.AccessChain,
+                        _module.TypePointer(SpirvStorageClass.Output, _floatType),
+                        _clipDistanceOutput,
+                        UInt(0)),
+                    Float(0f));
+
                 // Give every declared param output a defined starting value.
                 // Outputs the program actually exports overwrite this; the
                 // extras that only exist to satisfy the fragment interface stay
@@ -1577,13 +1619,44 @@ public static partial class Gen5SpirvTranslator
             EmitPixelPositionInput(10, 2, fragCoord, ref vgpr); // POS_Z_FLOAT
             EmitPixelPositionInput(11, 3, fragCoord, ref vgpr); // POS_W_FLOAT
 
-            // FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE and POS_FIXED_PT follow
-            // position inputs. Reserve their compact slots until their SPIR-V
-            // builtins are needed by a guest shader.
-            AdvancePixelInput(12, 1, ref vgpr);
+            EmitPixelFrontFaceInput(12, ref vgpr); // FRONT_FACE
+
+            // ANCILLARY, SAMPLE_COVERAGE and POS_FIXED_PT follow FRONT_FACE.
+            // Reserve their compact slots until their SPIR-V builtins are
+            // needed by a guest shader.
             AdvancePixelInput(13, 1, ref vgpr);
             AdvancePixelInput(14, 1, ref vgpr);
             AdvancePixelInput(15, 1, ref vgpr);
+        }
+
+        /// <summary>
+        /// Hardware hands the pixel shader a front-face VGPR holding the float
+        /// bits of +1.0 for a front-facing fragment and -1.0 for a back-facing
+        /// one, not a 0/1 flag: guest shaders feed it straight to float math and
+        /// compare it against zero. Leaving the register undefined made every
+        /// facing-dependent branch read whatever the slot happened to hold.
+        /// </summary>
+        private void EmitPixelFrontFaceInput(int bit, ref uint vgpr)
+        {
+            var mask = 1u << bit;
+            if ((_pixelInputAddress & mask) == 0)
+            {
+                return;
+            }
+
+            if ((_pixelInputEnable & mask) != 0)
+            {
+                var facing = Load(_boolType, _frontFacingInput);
+                var bits = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    facing,
+                    UInt(0x3F80_0000u),
+                    UInt(0xBF80_0000u));
+                StoreV(vgpr, bits, guardWithExec: false);
+            }
+
+            vgpr++;
         }
 
         private void AdvancePixelInput(int bit, uint dwordCount, ref uint vgpr)
@@ -4550,7 +4623,41 @@ public static partial class Gen5SpirvTranslator
                 outputValue,
                 Load(_vec4Type, outputVariable));
             Store(outputVariable, outputValue);
+            if (outputVariable == _positionOutput)
+            {
+                EmitZeroPositionClipGuard(outputValue);
+            }
+
             return true;
+        }
+
+        /// <summary>
+        /// A vertex whose exported position is all zeroes is discarded by the
+        /// PS5 before its 0/0 perspective divide; Vulkan has no equivalent rule
+        /// and rasterises the NaN that divide produces. Writing a negative clip
+        /// distance for those vertices collapses the primitive to its remaining
+        /// edge, which is what the guest expects to see.
+        /// </summary>
+        private void EmitZeroPositionClipGuard(uint position)
+        {
+            var equal = _module.AddInstruction(
+                SpirvOp.FOrdEqual,
+                _module.TypeVector(_boolType, 4),
+                position,
+                _module.ConstantNull(_vec4Type));
+            var invalid = _module.AddInstruction(SpirvOp.All, _boolType, equal);
+            var distance = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                invalid,
+                Float(-1f),
+                Float(0f));
+            var pointer = _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _module.TypePointer(SpirvStorageClass.Output, _floatType),
+                _clipDistanceOutput,
+                UInt(0));
+            Store(pointer, distance);
         }
 
         private bool PixelExportDebugAddressMatches()

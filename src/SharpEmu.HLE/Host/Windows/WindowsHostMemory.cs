@@ -27,11 +27,21 @@ internal sealed unsafe partial class WindowsHostMemory : IHostMemory
 
     public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
     {
+        if (GuestPlaceholder.TryClaim(desiredAddress, size, ToNativeProtection(protection), commit: true, out var claimed))
+        {
+            return claimed;
+        }
+
         return (ulong)VirtualAlloc((void*)desiredAddress, (nuint)size, MEM_COMMIT | MEM_RESERVE, ToNativeProtection(protection));
     }
 
     public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection)
     {
+        if (GuestPlaceholder.TryClaim(desiredAddress, size, ToNativeProtection(protection), commit: false, out var claimed))
+        {
+            return claimed;
+        }
+
         return (ulong)VirtualAlloc((void*)desiredAddress, (nuint)size, MEM_RESERVE, ToNativeProtection(protection));
     }
 
@@ -42,7 +52,10 @@ internal sealed unsafe partial class WindowsHostMemory : IHostMemory
 
     public bool Free(ulong address)
     {
-        return VirtualFree((void*)address, 0, MEM_RELEASE);
+        // Inside the guest window the address belongs to the reservation, not to
+        // whoever allocated it: hand it back as a placeholder so no host
+        // allocation can take an address the guest may map again.
+        return GuestPlaceholder.TryRestore(address) || VirtualFree((void*)address, 0, MEM_RELEASE);
     }
 
     public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
@@ -119,6 +132,7 @@ internal sealed unsafe partial class WindowsHostMemory : IHostMemory
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     private static partial void* VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

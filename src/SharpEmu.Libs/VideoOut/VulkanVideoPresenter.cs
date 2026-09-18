@@ -2269,6 +2269,78 @@ internal static unsafe class VulkanVideoPresenter
             ? 0x8000_0000u | ((format & 0x1FFu) << 8) | (numberType & 0xFFu)
             : 0;
 
+    // USCALED/SSCALED image formats hand the shader the stored integer as a
+    // float without normalising it: a stored 200 samples as 200.0, not 200/255.
+    // Vulkan makes no scaled format mandatory for images, and a driver that
+    // reports no image features for them does not fail cleanly: vkCreateImage
+    // on R8_USCALED faults inside NVIDIA's. Store those textures widened
+    // to a float format that represents every source integer exactly and filters
+    // the way the hardware does, which keeps the value the guest shader reads
+    // unchanged without needing the shader to know the descriptor's format.
+    // The packed 2_10_10_10 scaled formats are deliberately not widened - they
+    // are vertex formats in practice, and RequireSampledImageSupport names one
+    // if it ever reaches an image.
+    internal static bool TryGetScaledTextureWidening(
+        uint format,
+        uint numberType,
+        out Format hostFormat,
+        out int sourceBits)
+    {
+        (hostFormat, sourceBits) = numberType is 2 or 3
+            ? format switch
+            {
+                1 => (Format.R16Sfloat, 8),
+                3 => (Format.R16G16Sfloat, 8),
+                10 => (Format.R16G16B16A16Sfloat, 8),
+                2 => (Format.R32Sfloat, 16),
+                5 => (Format.R32G32Sfloat, 16),
+                12 => (Format.R32G32B32A32Sfloat, 16),
+                _ => (Format.Undefined, 0),
+            }
+            : (Format.Undefined, 0);
+        return sourceBits != 0;
+    }
+
+    // Widens the components of a scaled texture's texels to the float format
+    // TryGetScaledTextureWidening chose, preserving the unnormalised value.
+    // 8-bit sources become halves (integers up to 2048 are exact) and 16-bit
+    // sources become floats. Anything else is returned untouched.
+    internal static byte[] WidenScaledTexels(uint format, uint numberType, byte[] pixels)
+    {
+        if (!TryGetScaledTextureWidening(format, numberType, out _, out var sourceBits))
+        {
+            return pixels;
+        }
+
+        var signedSource = numberType == 3;
+        if (sourceBits == 8)
+        {
+            var widened = new byte[pixels.Length * 2];
+            for (var component = 0; component < pixels.Length; component++)
+            {
+                float value = signedSource ? (sbyte)pixels[component] : pixels[component];
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    widened.AsSpan(component * 2, 2),
+                    BitConverter.HalfToUInt16Bits((Half)value));
+            }
+
+            return widened;
+        }
+
+        var componentCount = pixels.Length / 2;
+        var widened32 = new byte[componentCount * 4];
+        for (var component = 0; component < componentCount; component++)
+        {
+            var raw = BinaryPrimitives.ReadUInt16LittleEndian(pixels.AsSpan(component * 2, 2));
+            float value = signedSource ? (short)raw : raw;
+            BinaryPrimitives.WriteSingleLittleEndian(
+                widened32.AsSpan(component * 4, 4),
+                value);
+        }
+
+        return widened32;
+    }
+
     internal static bool TryDecodeRenderTargetFormat(
         uint dataFormat,
         uint numberType,
@@ -4431,6 +4503,7 @@ internal static unsafe class VulkanVideoPresenter
                 ShaderStorageImageWriteWithoutFormat = supportedFeatures.ShaderStorageImageWriteWithoutFormat,
                 TextureCompressionBC = supportedFeatures.TextureCompressionBC,
                 RobustBufferAccess = supportedFeatures.RobustBufferAccess,
+                ShaderClipDistance = supportedFeatures.ShaderClipDistance,
             };
 
             if (!supportedFeatures.RobustBufferAccess)
@@ -4438,6 +4511,13 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     "[LOADER][WARN] GPU does not support robustBufferAccess " +
                     "translated shaders performing out-of-bounds buffer access may cause device loss.");
+            }
+
+            if (!supportedFeatures.ShaderClipDistance)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support shaderClipDistance " +
+                    "vertices the guest exports at the origin will rasterise instead of being culled.");
             }
 
             if (!supportedFeatures.ShaderInt64)
@@ -8674,9 +8754,10 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
-            var uploadPixels = texture.Format == 13
-                ? ExpandRgb32Pixels(pixels)
-                : pixels;
+            var uploadPixels = PrepareUploadPixels(
+                texture.Format,
+                texture.NumberType,
+                pixels);
             var debugName = TextureDebugName(texture, guestImage.Format);
             var (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
                 uploadPixels,
@@ -9226,9 +9307,10 @@ internal static unsafe class VulkanVideoPresenter
                 if ((ulong)texture.RgbaPixels.Length == expectedSize &&
                     texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
-                    var uploadPixels = texture.Format == 13
-                        ? ExpandRgb32Pixels(texture.RgbaPixels)
-                        : texture.RgbaPixels;
+                    var uploadPixels = PrepareUploadPixels(
+                        texture.Format,
+                        texture.NumberType,
+                        texture.RgbaPixels);
                     var uploadSize = (ulong)uploadPixels.Length;
                     resource.StagingBuffer = CreateBuffer(
                         uploadSize,
@@ -9438,6 +9520,7 @@ internal static unsafe class VulkanVideoPresenter
                 ? Math.Max(texture.Pitch, width)
                 : width;
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+            RequireSampledImageSupport(vkFormat, texture.Format, texture.NumberType);
 
             var layers = IsGuestTexture3D(texture.Type)
                 ? 1u
@@ -9467,6 +9550,7 @@ internal static unsafe class VulkanVideoPresenter
             DetileParams? gpuDetileParams = null;
             byte[]? gpuTiledSource = null;
             if (_gpuDetileEnabled &&
+                !TryGetScaledTextureWidening(texture.Format, texture.NumberType, out _, out _) &&
                 texture.Detile is { } detileCandidate &&
                 texture.TiledSource is { Length: > 0 } tiledCandidate &&
                 VulkanDetilePass.Supports(detileCandidate) &&
@@ -9536,9 +9620,10 @@ internal static unsafe class VulkanVideoPresenter
                 }
                 DumpTextureUpload(texture, pixels, rowLength, width, height);
                 TraceTextureUploadContents(texture, pixels, rowLength, width, height, vkFormat);
-                var uploadPixels = texture.Format == 13
-                    ? ExpandRgb32Pixels(pixels)
-                    : pixels;
+                var uploadPixels = PrepareUploadPixels(
+                    texture.Format,
+                    texture.NumberType,
+                    pixels);
                 contentFingerprint = ComputeTextureContentFingerprint(pixels);
                 (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
                     uploadPixels,
@@ -10271,6 +10356,17 @@ internal static unsafe class VulkanVideoPresenter
                 7 => ComponentSwizzle.A,
                 _ => ComponentSwizzle.Identity,
             };
+
+        // Formats the host cannot store the guest's bytes in verbatim: 32_32_32
+        // has no three-component Vulkan format, and the scaled formats are
+        // widened to float (see TryGetScaledTextureWidening).
+        private static byte[] PrepareUploadPixels(
+            uint format,
+            uint numberType,
+            byte[] pixels) =>
+            format == 13
+                ? ExpandRgb32Pixels(pixels)
+                : WidenScaledTexels(format, numberType, pixels);
 
         private static byte[] ExpandRgb32Pixels(byte[] pixels)
         {
@@ -11381,6 +11477,27 @@ internal static unsafe class VulkanVideoPresenter
             return (properties.OptimalTilingFeatures & FormatFeatureFlags.ColorAttachmentBit) != 0;
         }
 
+        // Vulkan guarantees image support for only a subset of formats, and a
+        // format the device reports nothing for is not a clean failure: the
+        // NVIDIA driver divides by zero inside vkCreateImage, which surfaces as
+        // an opaque DivideByZeroException from the draw. Ask first so an
+        // unsupported format names itself instead.
+        private void RequireSampledImageSupport(
+            Format format,
+            uint guestFormat,
+            uint guestNumberType)
+        {
+            _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, format, out var properties);
+            if ((properties.OptimalTilingFeatures & FormatFeatureFlags.SampledImageBit) != 0)
+            {
+                return;
+            }
+
+            throw new NotSupportedException(
+                $"guest texture format {guestFormat}/num={guestNumberType} maps to {format}, " +
+                "which this device reports no optimal-tiling sampled-image support for");
+        }
+
         private bool SupportsStorageImage(Format format)
         {
             _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, format, out var properties);
@@ -11388,32 +11505,29 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         internal static Format GetTextureFormat(uint format, uint numberType) =>
-            (format, numberType) switch
+            TryGetScaledTextureWidening(format, numberType, out var scaledHostFormat, out _)
+                ? scaledHostFormat
+                : (format, numberType) switch
             {
                 (9, _) => Format.A2B10G10R10UnormPack32,
                 (1, 0) => Format.R8Unorm,
                 (1, 1) => Format.R8SNorm,
-                (1, 2) => Format.R8Uscaled,
-                (1, 3) => Format.R8Sscaled,
                 (1, 4) => Format.R8Uint,
                 (1, 5) => Format.R8Sint,
                 (2, 7) => Format.R16Sfloat,
                 (2, 0) => Format.R16Unorm,
                 (2, 1) => Format.R16SNorm,
-                (2, 2) => Format.R16Uscaled,
-                (2, 3) => Format.R16Sscaled,
                 (2, 4) => Format.R16Uint,
                 (2, 5) => Format.R16Sint,
                 (3, 0) => Format.R8G8Unorm,
                 (3, 1) => Format.R8G8SNorm,
-                (3, 2) => Format.R8G8Uscaled,
-                (3, 3) => Format.R8G8Sscaled,
                 (3, 4) => Format.R8G8Uint,
                 (3, 5) => Format.R8G8Sint,
                 (4, 4) => Format.R32Uint,
                 (4, 5) => Format.R32Sint,
                 (4, 7) => Format.R32Sfloat,
                 (5, 0) => Format.R16G16Unorm,
+                (5, 1) => Format.R16G16SNorm,
                 (5, 4) => Format.R16G16Uint,
                 (5, 5) => Format.R16G16Sint,
                 (5, 7) => Format.R16G16Sfloat,
@@ -11426,6 +11540,7 @@ internal static unsafe class VulkanVideoPresenter
                 (8, 4) => Format.A2B10G10R10UintPack32,
                 (8, 5) => Format.A2B10G10R10SintPack32,
                 (10, 0) => Format.R8G8B8A8Unorm,
+                (10, 1) => Format.R8G8B8A8SNorm,
                 (10, 4) => Format.R8G8B8A8Uint,
                 (10, 5) => Format.R8G8B8A8Sint,
                 (10, 9) => Format.R8G8B8A8Srgb,
@@ -11435,6 +11550,7 @@ internal static unsafe class VulkanVideoPresenter
                 (11, 5) => Format.R32G32Sint,
                 (11, 7) => Format.R32G32Sfloat,
                 (12, 0) => Format.R16G16B16A16Unorm,
+                (12, 1) => Format.R16G16B16A16SNorm,
                 (12, 4) => Format.R16G16B16A16Uint,
                 (12, 5) => Format.R16G16B16A16Sint,
                 (12, 7) => Format.R16G16B16A16Sfloat,
@@ -13589,9 +13705,10 @@ internal static unsafe class VulkanVideoPresenter
             var guestDataFormat = (target.GuestFormat & 0x8000_0000u) != 0
                 ? (target.GuestFormat >> 8) & 0x1FFu
                 : 0;
-            var uploadPixels = guestDataFormat == 13
-                ? ExpandRgb32Pixels(pixels)
-                : pixels;
+            var uploadPixels = PrepareUploadPixels(
+                guestDataFormat,
+                target.GuestFormat & 0xFFu,
+                pixels);
             var expectedByteCount = GetVulkanImageByteCount(
                 target.Format,
                 target.Width,

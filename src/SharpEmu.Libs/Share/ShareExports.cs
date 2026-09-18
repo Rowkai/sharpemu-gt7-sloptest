@@ -140,6 +140,33 @@ public static class ShareExports
         return false;
     }
 
+    // sceShareGetRunningStatus(uint32_t *status): reports which share activity
+    // is in progress. Nothing broadcasts or records under SharpEmu, so the
+    // status word is clear. Callers mask bits out of it and combine that with
+    // the return code, so leaving the word untouched would have them test
+    // caller stack garbage.
+    [SysAbiExport(
+        Nid = "crFxyW3HdK0",
+        ExportName = "sceShareGetRunningStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceShareUtility")]
+    public static int ShareGetRunningStatus(CpuContext ctx)
+    {
+        var statusAddress = ctx[CpuRegister.Rdi];
+        if (statusAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!ctx.TryWriteUInt32(statusAddress, 0))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceShare("get_running_status status=0x00000000");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
     private static string FormatTraceString(string value)
     {
         var normalized = value.Replace("\r", "\\r", StringComparison.Ordinal).Replace("\n", "\\n", StringComparison.Ordinal);

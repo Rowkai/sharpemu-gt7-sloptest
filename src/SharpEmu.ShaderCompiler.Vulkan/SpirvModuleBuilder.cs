@@ -187,6 +187,7 @@ public enum SpirvCapability : uint
     Float64 = 10,
     Int64 = 11,
     Int16 = 22,
+    ClipDistance = 32,
     ImageGatherExtended = 25,
     StorageImageExtendedFormats = 49,
     ImageQuery = 50,
@@ -244,6 +245,7 @@ public enum SpirvDecoration : uint
 public enum SpirvBuiltIn : uint
 {
     Position = 0,
+    ClipDistance = 3,
     VertexIndex = 42,
     InstanceIndex = 43,
     FragCoord = 15,

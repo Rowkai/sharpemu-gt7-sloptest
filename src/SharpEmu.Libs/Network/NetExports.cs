@@ -23,14 +23,26 @@ public static class NetExports
     private const int NetErrnoWouldBlock = 35;
     private const int NetErrnoAddressInUse = 48;
     private const int NetErrnoNotInitialized = 200;
+    private const int NetErrorTooManyFiles = unchecked((int)0x80410118);
+    private const int NetErrnoTooManyFiles = 24;
     private const int MaxNameLength = 256;
+    private const int MsgPeek = 0x2;
+    private const int MsgOob = 0x1;
+    private const int MsgDontWait = 0x80;
+    // Socket descriptors are POSIX file descriptors, and titles put them in an
+    // fd_set: a FD_SETSIZE-bit stack bitmap indexed by the descriptor itself.
+    // A descriptor at or past FD_SETSIZE therefore does not fail a call, it
+    // writes off the end of the caller's bitmap. The kernel keeps them small by
+    // handing out the lowest free one, so this does too. 0-2 stay reserved for
+    // the standard streams.
+    private const int FirstSocketDescriptor = 3;
+    private const int SocketDescriptorLimit = 1024;
 
     private static readonly ConcurrentDictionary<int, NetPool> _pools = new();
     private static readonly ConcurrentDictionary<int, ResolverContext> _resolvers = new();
     private static readonly ConcurrentDictionary<int, Socket> _sockets = new();
     private static int _nextPoolId;
     private static int _nextResolverId = 0x2000;
-    private static int _nextSocketId = 0x4000;
     // The platform networking module is usable immediately after it is loaded.
     // Games and middleware (notably FMOD) can create internal sockets before an
     // explicit sceNetInit call reaches application code.
@@ -102,8 +114,12 @@ public static class NetExports
         try
         {
             var socket = new Socket(addressFamily, socketType, protocolType);
-            var id = Interlocked.Increment(ref _nextSocketId);
-            _sockets[id] = socket;
+            if (!TryAllocateSocketDescriptor(socket, out var id))
+            {
+                socket.Dispose();
+                return SetNetError(ctx, NetErrorTooManyFiles, NetErrnoTooManyFiles);
+            }
+
             TraceNet("socket.create", id, unchecked((ulong)family), unchecked((ulong)type), unchecked((ulong)protocol));
             ctx[CpuRegister.Rax] = unchecked((ulong)id);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -464,8 +480,12 @@ public static class NetExports
         try
         {
             var accepted = socket.Accept();
-            var acceptedId = Interlocked.Increment(ref _nextSocketId);
-            _sockets[acceptedId] = accepted;
+            if (!TryAllocateSocketDescriptor(accepted, out var acceptedId))
+            {
+                accepted.Dispose();
+                return SetNetError(ctx, NetErrorTooManyFiles, NetErrnoTooManyFiles);
+            }
+
             TraceNet("socket.accept", acceptedId, unchecked((ulong)id), 0, 0);
             ctx[CpuRegister.Rax] = unchecked((ulong)acceptedId);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -478,6 +498,181 @@ public static class NetExports
         {
             return SetNetError(ctx, NetErrorInvalidArgument, NetErrnoInvalidArgument);
         }
+    }
+
+    // recv/recvfrom were missing entirely, which is worse than a socket error:
+    // an unresolved import returns ORBIS_GEN2_ERROR_NOT_FOUND, so a title's
+    // receive loop sees a code no socket can produce and cannot fall back to
+    // its would-block path. GT7 polls both several thousand times per boot.
+    [SysAbiExport(
+        Nid = "9wO9XrMsNhc",
+        ExportName = "sceNetRecv",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetRecv(CpuContext ctx)
+    {
+        return ReceiveCore(ctx, wantSender: false);
+    }
+
+    [SysAbiExport(
+        Nid = "304ooNZxWDY",
+        ExportName = "sceNetRecvfrom",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetRecvfrom(CpuContext ctx)
+    {
+        return ReceiveCore(ctx, wantSender: true);
+    }
+
+    private static int ReceiveCore(CpuContext ctx, bool wantSender)
+    {
+        var id = unchecked((int)ctx[CpuRegister.Rdi]);
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var length = unchecked((int)ctx[CpuRegister.Rdx]);
+        var flags = unchecked((int)ctx[CpuRegister.Rcx]);
+        if (!_sockets.TryGetValue(id, out var socket))
+        {
+            return SetNetError(ctx, NetErrorBadFileDescriptor, NetErrnoBadFileDescriptor);
+        }
+
+        if (length < 0 || (length > 0 && bufferAddress == 0))
+        {
+            return SetNetError(ctx, NetErrorInvalidArgument, NetErrnoInvalidArgument);
+        }
+
+        var socketFlags = SocketFlags.None;
+        if ((flags & MsgPeek) != 0)
+        {
+            socketFlags |= SocketFlags.Peek;
+        }
+
+        if ((flags & MsgOob) != 0)
+        {
+            socketFlags |= SocketFlags.OutOfBand;
+        }
+
+        // SCE_NET_MSG_DONTWAIT has no Socket flag: ask whether data is there and
+        // report would-block rather than parking a guest thread in the emulator.
+        if ((flags & MsgDontWait) != 0 && !socket.Poll(0, SelectMode.SelectRead))
+        {
+            return SetNetError(ctx, NetErrorWouldBlock, NetErrnoWouldBlock);
+        }
+
+        var buffer = new byte[length];
+        try
+        {
+            int received;
+            EndPoint sender = new IPEndPoint(IPAddress.Any, 0);
+            if (wantSender)
+            {
+                received = socket.ReceiveFrom(buffer, 0, length, socketFlags, ref sender);
+            }
+            else
+            {
+                received = socket.Receive(buffer, 0, length, socketFlags);
+            }
+
+            if (received > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, received)))
+            {
+                return SetNetError(ctx, NetErrorInvalidArgument, NetErrnoInvalidArgument);
+            }
+
+            if (wantSender &&
+                !TryWriteSocketAddress(ctx, ctx[CpuRegister.R8], ctx[CpuRegister.R9], sender as IPEndPoint))
+            {
+                return SetNetError(ctx, NetErrorInvalidArgument, NetErrnoInvalidArgument);
+            }
+
+            TraceNet("socket.recv", id, unchecked((ulong)received), unchecked((ulong)length), unchecked((uint)flags));
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)received);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.IOPending or SocketError.TimedOut)
+        {
+            return SetNetError(ctx, NetErrorWouldBlock, NetErrnoWouldBlock);
+        }
+        catch (SocketException)
+        {
+            return SetNetError(ctx, NetErrorInvalidArgument, NetErrnoInvalidArgument);
+        }
+        catch (ObjectDisposedException)
+        {
+            return SetNetError(ctx, NetErrorBadFileDescriptor, NetErrnoBadFileDescriptor);
+        }
+    }
+
+    /// <summary>
+    /// Writes the sender address recvfrom reports, and updates the caller's
+    /// address length in place. Both may be null: recvfrom is allowed to be
+    /// called with no interest in the sender.
+    /// </summary>
+    private static bool TryWriteSocketAddress(
+        CpuContext ctx,
+        ulong address,
+        ulong lengthAddress,
+        IPEndPoint? endpoint)
+    {
+        if (address == 0 || endpoint is null)
+        {
+            return true;
+        }
+
+        Span<byte> bytes = stackalloc byte[16];
+        bytes.Clear();
+        bytes[0] = 16;
+        bytes[1] = 2;
+        BinaryPrimitives.WriteUInt16BigEndian(bytes[2..4], unchecked((ushort)endpoint.Port));
+        if (!endpoint.Address.TryWriteBytes(bytes[4..8], out var written) || written != 4)
+        {
+            return false;
+        }
+
+        if (!ctx.Memory.TryWrite(address, bytes))
+        {
+            return false;
+        }
+
+        if (lengthAddress == 0)
+        {
+            return true;
+        }
+
+        Span<byte> lengthBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(lengthBytes, 16u);
+        return ctx.Memory.TryWrite(lengthAddress, lengthBytes);
+    }
+
+    /// <summary>
+    /// Claims the lowest free socket descriptor, the way the kernel's descriptor
+    /// table does. See <see cref="SocketDescriptorLimit"/> for why the value has
+    /// to stay small rather than merely unique.
+    /// </summary>
+    /// <remarks>
+    /// ponytail: linear scan of a table that never exceeds 1021 live entries,
+    /// on a path taken once per socket. A free-list is the upgrade if a title
+    /// ever churns sockets hard enough for it to show.
+    /// </remarks>
+    internal static bool TryAllocateSocketDescriptor(Socket socket, out int descriptor)
+    {
+        for (var candidate = FirstSocketDescriptor; candidate < SocketDescriptorLimit; candidate++)
+        {
+            if (_sockets.TryAdd(candidate, socket))
+            {
+                descriptor = candidate;
+                return true;
+            }
+        }
+
+        descriptor = -1;
+        return false;
+    }
+
+    /// <summary>
+    /// Returns a descriptor to the table so it can be handed out again.
+    /// </summary>
+    internal static bool ReleaseSocketDescriptor(int descriptor)
+    {
+        return _sockets.TryRemove(descriptor, out _);
     }
 
     [SysAbiExport(
@@ -799,6 +994,68 @@ public static class NetExports
         TraceNet("inet_pton", addressFamily, sourceAddress, destinationAddress, (ulong)bytes.Length);
         ctx[CpuRegister.Rax] = 1;
         return 1;
+    }
+
+    // sceNetInetNtop(int af, const void *src, char *dst, socklen_t size): the
+    // inverse of sceNetInetPton. BSD returns dst on success and NULL on
+    // failure — not an error code — so a title that formats an address gets a
+    // null pointer today rather than a string.
+    [SysAbiExport(
+        Nid = "9vA2aW+CHuA",
+        ExportName = "sceNetInetNtop",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetInetNtop(CpuContext ctx)
+    {
+        var addressFamily = unchecked((int)ctx[CpuRegister.Rdi]);
+        var sourceAddress = ctx[CpuRegister.Rsi];
+        var destinationAddress = ctx[CpuRegister.Rdx];
+        var destinationSize = unchecked((uint)ctx[CpuRegister.Rcx]);
+
+        var addressLength = addressFamily switch
+        {
+            2 => 4,    // AF_INET
+            28 => 16,  // AF_INET6
+            _ => 0,
+        };
+
+        if (addressLength == 0 || sourceAddress == 0 || destinationAddress == 0)
+        {
+            // NULL is the failure return; the reason goes to errno.
+            return SetNetError(ctx, 0, NetErrnoInvalidArgument);
+        }
+
+        Span<byte> raw = stackalloc byte[16];
+        var source = raw[..addressLength];
+        if (!ctx.Memory.TryRead(sourceAddress, source))
+        {
+            // NULL is the failure return; the reason goes to errno.
+            return SetNetError(ctx, 0, NetErrnoInvalidArgument);
+        }
+
+        var text = new IPAddress(source).ToString();
+        var encoded = Encoding.UTF8.GetBytes(text);
+
+        // BSD reports a destination too small for the text through ENOSPC and a
+        // NULL return rather than truncating it.
+        if (destinationSize <= (uint)encoded.Length)
+        {
+            // NULL is the failure return; the reason goes to errno.
+            return SetNetError(ctx, 0, NetErrnoInvalidArgument);
+        }
+
+        Span<byte> terminated = stackalloc byte[encoded.Length + 1];
+        encoded.CopyTo(terminated);
+        terminated[encoded.Length] = 0;
+        if (!ctx.Memory.TryWrite(destinationAddress, terminated))
+        {
+            // NULL is the failure return; the reason goes to errno.
+            return SetNetError(ctx, 0, NetErrnoInvalidArgument);
+        }
+
+        TraceNet("inet_ntop", addressFamily, sourceAddress, destinationAddress, destinationSize);
+        ctx[CpuRegister.Rax] = destinationAddress;
+        return 0;
     }
 
     private static void TraceNet(string operation, int id, ulong arg0, ulong arg1, ulong arg2)

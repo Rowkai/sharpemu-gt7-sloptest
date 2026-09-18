@@ -55,6 +55,26 @@ public static class FiberExports
     private static readonly ConcurrentDictionary<ulong, FiberStackRange> _stackRanges = new();
     private static readonly ConcurrentDictionary<ulong, FiberThreadState> _threadStates = new();
 
+    // SHARPEMU_LOG_FIBER=1 traces every transition and checks sceFiberGetSelf;
+    // =getself only checks sceFiberGetSelf, which keeps a fiber-heavy title fast
+    // enough to reach the code under investigation. Read once: the transition
+    // path runs per fiber switch.
+    private static readonly string? _fiberTraceMode = Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER");
+    private static readonly bool _traceFiberTransitions = string.Equals(_fiberTraceMode, "1", StringComparison.Ordinal);
+    private static readonly bool _checkFiberGetSelf =
+        _traceFiberTransitions || string.Equals(_fiberTraceMode, "getself", StringComparison.Ordinal);
+
+    // The fiber each guest thread last entered, recorded only at the transitions
+    // themselves. It is deliberately not derived from _threadStates or the
+    // per-host-thread current fiber, so sceFiberGetSelf can be checked against it
+    // rather than against its own inputs.
+    private static readonly ConcurrentDictionary<ulong, FiberEntryRecord> _enteredFibers = new();
+    private static readonly ConcurrentDictionary<ulong, long> _fiberEntryCounts = new();
+    private static long _fiberEntries;
+    private static long _getSelfOutsideFiber;
+    private static long _getSelfMismatches;
+    private static long _getSelfWrongFiber;
+
     static FiberExports()
     {
         RunFiberSelfChecks();
@@ -67,6 +87,8 @@ public static class FiberExports
             _continuations.Clear();
             _stackRanges.Clear();
             _threadStates.Clear();
+            _enteredFibers.Clear();
+            _fiberEntryCounts.Clear();
             Volatile.Write(ref _contextSizeCheck, 0);
         }
     }
@@ -286,6 +308,7 @@ public static class FiberExports
         }
 
         _ = GuestThreadExecution.EnterFiber(0);
+        NoteFiberEntered(ctx, 0);
         GuestThreadExecution.RequestCurrentContextTransfer(transferTarget);
         TraceFiber(
             $"return-to-thread fiber=0x{fiberAddress:X16} " +
@@ -307,6 +330,11 @@ public static class FiberExports
         }
 
         var fiberAddress = ResolveCurrentFiberAddress(ctx);
+        if (_checkFiberGetSelf)
+        {
+            CheckGetSelfAgainstTransitions(ctx, fiberAddress);
+        }
+
         if (fiberAddress == 0)
         {
             return SetReturn(ctx, FiberErrorPermission);
@@ -675,6 +703,7 @@ public static class FiberExports
         }
 
         _ = GuestThreadExecution.EnterFiber(fiber);
+        NoteFiberEntered(ctx, fiber);
         GuestThreadExecution.RequestCurrentContextTransfer(transferTarget);
         TraceFiber(
             $"transfer reason={reason} from=0x{previousFiber:X16} to=0x{fiber:X16} resume={resumed} " +
@@ -731,8 +760,9 @@ public static class FiberExports
                 entryRsp,
                 entryRsp,
                 ctx.Rflags == 0 ? 0x202UL : ctx.Rflags,
-                ctx.FsBase,
-                ctx.GsBase,
+                // No thread pointer: see CaptureContinuation.
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -762,6 +792,18 @@ public static class FiberExports
         continuation.ArgOnRunAddress == 0 ||
         TryWriteUInt64(ctx, continuation.ArgOnRunAddress, argument);
 
+    /// <summary>
+    /// Captures a fiber's resume point. A fiber switch saves the callee-saved
+    /// registers, stack and FPU state — never the thread pointer: fs belongs to the
+    /// kernel thread, and a fiber suspended on one thread runs with the TLS of
+    /// whichever thread resumes it (ShadPS4's switch saves rsp/rbp/rbx/r12–r15 and
+    /// MXCSR/FPUCW only, and keeps the current fiber in the per-thread TCB). Titles
+    /// rely on this: a job system that migrates fibers between workers detaches and
+    /// reattaches its own TLS job state around the switch. Carrying fs here made a
+    /// resumed fiber run on the suspending worker's TLS block, so two workers shared
+    /// job state (GT7, docs/gt7 blocker E). Zero leaves the resuming thread's fs in
+    /// place — ApplyGuestContinuation only overwrites a non-zero value.
+    /// </summary>
     private static GuestCpuContinuation CaptureContinuation(
         CpuContext ctx,
         ulong resumeRip,
@@ -772,8 +814,8 @@ public static class FiberExports
             resumeRsp,
             returnSlotAddress,
             ctx.Rflags == 0 ? 0x202UL : ctx.Rflags,
-            ctx.FsBase,
-            ctx.GsBase,
+            0,
+            0,
             0,
             ctx[CpuRegister.Rcx],
             ctx[CpuRegister.Rdx],
@@ -1123,11 +1165,91 @@ public static class FiberExports
 
     private static void TraceFiber(string message)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal))
+        if (_traceFiberTransitions)
         {
-            Console.Error.WriteLine($"[LOADER][TRACE] fiber.{message}");
+            WriteFiberTrace(message);
         }
     }
+
+    // Every fiber line names the guest thread and the host thread it ran on, so a
+    // transition and a later sceFiberGetSelf can be tied to the same guest thread.
+    private static void WriteFiberTrace(string message) =>
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] fiber.{message} thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X} " +
+            $"host={Environment.CurrentManagedThreadId}");
+
+    private static void NoteFiberEntered(CpuContext ctx, ulong fiber)
+    {
+        if (!_checkFiberGetSelf)
+        {
+            return;
+        }
+
+        var key = GetThreadKey(ctx);
+        _enteredFibers[key] = new FiberEntryRecord(fiber, Environment.CurrentManagedThreadId);
+        if (fiber == 0)
+        {
+            return;
+        }
+
+        // Entry counts make "not in a fiber" interpretable: zero mismatches means
+        // nothing unless the threads asking are shown to run fibers at all.
+        var perThread = _fiberEntryCounts.AddOrUpdate(key, 1, static (_, value) => value + 1);
+        var total = Interlocked.Increment(ref _fiberEntries);
+        if (perThread == 1 || (total & 0xFFF) == 0)
+        {
+            WriteFiberTrace(
+                $"enter-summary total={total} key=0x{key:X} thread_entries={perThread} fiber=0x{fiber:X16} " +
+                $"threads_with_fibers={_fiberEntryCounts.Count}");
+        }
+    }
+
+    /// <summary>
+    /// Compares sceFiberGetSelf's answer with the fiber this guest thread last
+    /// entered through a transition. "Not in a fiber" while the transitions say the
+    /// thread is running one is the case under investigation (docs/gt7 blocker F):
+    /// GT7's wait primitive picks a thread wait instead of a fiber wait on that
+    /// answer. Benign results are only counted and sampled.
+    /// </summary>
+    private static void CheckGetSelfAgainstTransitions(CpuContext ctx, ulong resolved)
+    {
+        var key = GetThreadKey(ctx);
+        var caller = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame) ? frame.ReturnRip : 0;
+        _enteredFibers.TryGetValue(key, out var entered);
+        if (resolved == 0 && entered.Fiber != 0)
+        {
+            var count = Interlocked.Increment(ref _getSelfMismatches);
+            WriteFiberTrace(
+                $"getself-mismatch#{count} key=0x{key:X} entered=0x{entered.Fiber:X16} " +
+                $"entered_host={entered.HostThreadId} tls_fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} " +
+                $"thread_state={_threadStates.ContainsKey(key)} rsp=0x{ctx[CpuRegister.Rsp]:X16} caller=0x{caller:X16}");
+            return;
+        }
+
+        if (resolved != 0 && resolved != entered.Fiber)
+        {
+            var count = Interlocked.Increment(ref _getSelfWrongFiber);
+            WriteFiberTrace(
+                $"getself-wrong-fiber#{count} key=0x{key:X} resolved=0x{resolved:X16} entered=0x{entered.Fiber:X16} " +
+                $"entered_host={entered.HostThreadId} tls_fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} " +
+                $"caller=0x{caller:X16}");
+            return;
+        }
+
+        if (resolved == 0)
+        {
+            var count = Interlocked.Increment(ref _getSelfOutsideFiber);
+            if (count <= 8 || (count & 0xFFF) == 0)
+            {
+                _fiberEntryCounts.TryGetValue(key, out var threadEntries);
+                WriteFiberTrace(
+                    $"getself-outside#{count} key=0x{key:X} thread_entries={threadEntries} caller=0x{caller:X16} " +
+                    $"mismatches={Interlocked.Read(ref _getSelfMismatches)} wrong={Interlocked.Read(ref _getSelfWrongFiber)}");
+            }
+        }
+    }
+
+    private readonly record struct FiberEntryRecord(ulong Fiber, int HostThreadId);
 
     private readonly record struct FiberFields(
         uint State,

@@ -19,6 +19,7 @@ internal sealed class EmulatorProcess : IDisposable
 
     private const uint ExtendedStartupInfoPresent = 0x00080000;
     private const uint CreateNoWindow = 0x08000000;
+    private const uint CreateSuspended = 0x00000004;
     private const int StartfUseStdHandles = 0x00000100;
     private const uint HandleFlagInherit = 0x00000001;
     private const uint Infinite = 0xFFFFFFFF;
@@ -241,19 +242,34 @@ internal sealed class EmulatorProcess : IDisposable
             childArguments.AddRange(arguments);
             var commandLine = new StringBuilder(BuildCommandLine(exePath, childArguments));
             ProcessInformation processInfo;
+            // With the reservation on, the child starts suspended so its guest
+            // address space can be claimed before its own runtime allocates
+            // anywhere in it.
+            var reserveGuestAddressSpace = SharpEmu.Core.Memory.GuestAddressSpaceReservation.IsEnabled;
             lock (EnvironmentGate)
             {
                 var previousValue = Environment.GetEnvironmentVariable(MitigatedChildEnvironment);
+                var previousHandoff = Environment.GetEnvironmentVariable(
+                    SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable);
                 try
                 {
                     Environment.SetEnvironmentVariable(MitigatedChildEnvironment, "1");
+                    if (reserveGuestAddressSpace)
+                    {
+                        Environment.SetEnvironmentVariable(
+                            SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable,
+                            SharpEmu.Core.Memory.GuestAddressSpaceReservation.DescribeWindows());
+                    }
+
                     if (!CreateProcessW(
                             null,
                             commandLine,
                             0,
                             0,
                             true,
-                            ExtendedStartupInfoPresent | CreateNoWindow,
+                            reserveGuestAddressSpace
+                                ? ExtendedStartupInfoPresent | CreateNoWindow | CreateSuspended
+                                : ExtendedStartupInfoPresent | CreateNoWindow,
                             0,
                             string.IsNullOrWhiteSpace(workingDirectory)
                                 ? Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory
@@ -267,11 +283,29 @@ internal sealed class EmulatorProcess : IDisposable
                 finally
                 {
                     Environment.SetEnvironmentVariable(MitigatedChildEnvironment, previousValue);
+                    Environment.SetEnvironmentVariable(
+                        SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable, previousHandoff);
                 }
             }
 
             processHandle = processInfo.Process;
             threadHandle = processInfo.Thread;
+            if (reserveGuestAddressSpace)
+            {
+                if (!SharpEmu.Core.Memory.GuestAddressSpaceReservation.TryReserveInProcess(
+                        processHandle, out var reservedBytes, out var reserveFailure))
+                {
+                    throw new InvalidOperationException(
+                        $"Could not reserve the guest address space in the emulator process: {reserveFailure}");
+                }
+
+                ForwardOutput(
+                    $"[LOADER][INFO] Reserved guest address space: 0x{reservedBytes:X} bytes in " +
+                    SharpEmu.Core.Memory.GuestAddressSpaceReservation.DescribeWindows(),
+                    isError: true);
+                _ = ResumeThread(threadHandle);
+            }
+
             CloseHandle(stdoutWrite);
             stdoutWrite = 0;
             CloseHandle(stderrWrite);
@@ -641,6 +675,9 @@ internal sealed class EmulatorProcess : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool TerminateProcess(nint process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(nint thread);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

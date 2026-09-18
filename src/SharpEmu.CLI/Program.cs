@@ -22,6 +22,7 @@ internal static partial class Program
     private const int DefaultImportTraceLimit = 32;
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint INFINITE = 0xFFFFFFFF;
     private const int PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = 0x00020007;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
@@ -238,6 +239,30 @@ internal static partial class Program
         if (!isMitigatedChild && TryRunMitigatedChild(args, out var childExitCode))
         {
             return childExitCode;
+        }
+
+        // A launch that lost its reservation must not continue: the guest would
+        // map over host memory again, which is how the race-load deadlock
+        // happened.
+        var reservationHandoff = Environment.GetEnvironmentVariable(
+            SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable);
+        if (!string.IsNullOrWhiteSpace(reservationHandoff))
+        {
+            if (!SharpEmu.Core.Memory.GuestAddressSpaceReservation.TryVerify(
+                    reservationHandoff, out var coverage, out var verifyFailure))
+            {
+                Console.Error.WriteLine($"[LOADER][ERROR] Guest address-space reservation is not usable: {verifyFailure}");
+                return 5;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Guest address space reserved: 0x{coverage.ReservedBytes:X} bytes, " +
+                $"{coverage.Holes.Length} host holes");
+            foreach (var (start, end) in coverage.Holes)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO]   host hole 0x{start:X16}-0x{end:X16} (0x{end - start:X} bytes)");
+            }
         }
 
         if (!TryParseArguments(
@@ -569,24 +594,60 @@ internal static partial class Program
 
             var cmdLineBuilder = new StringBuilder(commandLine);
             nint jobHandle = 0;
+            // With the reservation on, the child starts suspended so its guest
+            // address space can be claimed before its own runtime allocates
+            // anywhere in it.
+            var reserveGuestAddressSpace = SharpEmu.Core.Memory.GuestAddressSpaceReservation.IsEnabled;
+            var previousHandoff = Environment.GetEnvironmentVariable(
+                SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable);
             Environment.SetEnvironmentVariable(MitigatedChildEnvironment, "1");
+            if (reserveGuestAddressSpace)
+            {
+                Environment.SetEnvironmentVariable(
+                    SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable,
+                    SharpEmu.Core.Memory.GuestAddressSpaceReservation.DescribeWindows());
+            }
+
             var created = CreateProcessW(
                 null,
                 cmdLineBuilder,
                 0,
                 0,
                 true,
-                EXTENDED_STARTUPINFO_PRESENT,
+                reserveGuestAddressSpace
+                    ? EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
+                    : EXTENDED_STARTUPINFO_PRESENT,
                 0,
                 Environment.CurrentDirectory,
                 ref startupInfoEx,
                 out var processInfo);
             Environment.SetEnvironmentVariable(MitigatedChildEnvironment, previousChildEnvironment);
+            Environment.SetEnvironmentVariable(
+                SharpEmu.Core.Memory.GuestAddressSpaceReservation.HandoffVariable, previousHandoff);
             if (!created)
             {
                 childExitCode = 5;
                 Console.Error.WriteLine($"[ERROR] Failed to launch mitigated child process: {Marshal.GetLastWin32Error()}");
                 return true;
+            }
+
+            if (reserveGuestAddressSpace)
+            {
+                if (!SharpEmu.Core.Memory.GuestAddressSpaceReservation.TryReserveInProcess(
+                        processInfo.hProcess, out var reservedBytes, out var reserveFailure))
+                {
+                    _ = TerminateProcess(processInfo.hProcess, 5);
+                    CloseHandle(processInfo.hThread);
+                    CloseHandle(processInfo.hProcess);
+                    childExitCode = 5;
+                    Console.Error.WriteLine($"[ERROR] Could not reserve the guest address space: {reserveFailure}");
+                    return true;
+                }
+
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Reserved guest address space: 0x{reservedBytes:X} bytes " +
+                    $"({reservedBytes / (1024.0 * 1024 * 1024):N1} GiB) in {SharpEmu.Core.Memory.GuestAddressSpaceReservation.DescribeWindows()}");
+                _ = ResumeThread(processInfo.hThread);
             }
 
             try
@@ -1645,6 +1706,9 @@ internal static partial class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool TerminateProcess(nint process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(nint thread);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

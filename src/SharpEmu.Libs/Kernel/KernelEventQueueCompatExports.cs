@@ -12,10 +12,12 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelEventQueueCompatExports
 {
     private const int KernelEventSize = 0x20;
+    private const int KernelTimespecSize = 0x10;
     public const short KernelEventFilterGraphics = -14;
     public const short KernelEventFilterUser = -11;
-    public const short KernelEventFilterAmpr = -16;
+    public const short KernelEventFilterAmpr = -25;
     public const short KernelEventFilterAmprSystem = -17;
+    public const short KernelEventFilterHrTimer = -15;
     public const ushort KernelEventFlagClear = 0x20;
 
     private static readonly object _eventQueueGate = new();
@@ -29,6 +31,7 @@ public static class KernelEventQueueCompatExports
     private static long _nextEventRegistrationGeneration;
     private static long _nextEventQueueGeneration;
     private static long _nextEventQueueRuntimeId;
+    private static readonly Dictionary<(ulong Handle, ulong Ident), Timer> _hrTimers = new();
 
     private sealed record EventQueueRuntimeIdentity(ulong Id);
 
@@ -401,6 +404,151 @@ public static class KernelEventQueueCompatExports
         return triggered
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+    }
+
+    [SysAbiExport(
+        Nid = "R74tt43xP6k",
+        ExportName = "sceKernelAddHRTimerEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelAddHRTimerEvent(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var ident = ctx[CpuRegister.Rsi];
+        var timespecAddress = ctx[CpuRegister.Rdx];
+        var userData = ctx[CpuRegister.Rcx];
+
+        if (timespecAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> timespec = stackalloc byte[KernelTimespecSize];
+        if (!ctx.Memory.TryRead(timespecAddress, timespec))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var seconds = BinaryPrimitives.ReadInt64LittleEndian(timespec[0x00..0x08]);
+        var nanoseconds = BinaryPrimitives.ReadInt64LittleEndian(timespec[0x08..0x10]);
+        if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1_000_000_000)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!RegisterEvent(handle, ident, KernelEventFilterHrTimer, userData))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        ScheduleHrTimer(handle, ident, userData, seconds, nanoseconds);
+        TraceEventQueue(
+            ctx,
+            "add_hrtimer",
+            handle,
+            $"ident=0x{ident:X16} sec={seconds} nsec={nanoseconds}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "J+LF6LwObXU",
+        ExportName = "sceKernelDeleteHRTimerEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelDeleteHRTimerEvent(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var ident = ctx[CpuRegister.Rsi];
+        CancelHrTimer(handle, ident);
+        var deleted = DeleteRegisteredEvent(handle, ident, KernelEventFilterHrTimer);
+        TraceEventQueue(ctx, "delete_hrtimer", handle, $"ident=0x{ident:X16}");
+        return deleted
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+    }
+
+    /// <summary>
+    /// Arms the one-shot timer behind <c>sceKernelAddHRTimerEvent</c>. The
+    /// hardware timer fires once and the registration is consumed with it, so a
+    /// title that wants a periodic tick re-arms it from its own event loop —
+    /// re-arming an ident that is already pending replaces the pending deadline
+    /// rather than queueing a second one.
+    /// </summary>
+    /// <remarks>
+    /// ponytail: paced by <see cref="Timer"/>, whose resolution is the host
+    /// scheduler tick (~15 ms unless something else has raised the timer
+    /// resolution), while the name promises high resolution and callers ask for
+    /// single-digit milliseconds. It fires late rather than early, which paces a
+    /// frame loop slowly but keeps it correct. A spin-assisted timer thread is
+    /// the upgrade if a title turns out to need the accuracy.
+    /// </remarks>
+    private static void ScheduleHrTimer(
+        ulong handle,
+        ulong ident,
+        ulong userData,
+        long seconds,
+        long nanoseconds)
+    {
+        var delay = TimeSpan.FromTicks(
+            (seconds * TimeSpan.TicksPerSecond) + (nanoseconds / 100));
+        var key = (handle, ident);
+
+        lock (_eventQueueGate)
+        {
+            if (_hrTimers.TryGetValue(key, out var existing))
+            {
+                existing.Change(delay, Timeout.InfiniteTimeSpan);
+                return;
+            }
+        }
+
+        var timer = new Timer(
+            _ =>
+            {
+                lock (_eventQueueGate)
+                {
+                    if (_hrTimers.Remove(key, out var fired))
+                    {
+                        fired.Dispose();
+                    }
+                    else
+                    {
+                        // Cancelled between firing and taking the gate.
+                        return;
+                    }
+                }
+
+                TriggerRegisteredEvent(handle, ident, KernelEventFilterHrTimer, userData);
+                DeleteRegisteredEvent(handle, ident, KernelEventFilterHrTimer);
+            },
+            state: null,
+            Timeout.InfiniteTimeSpan,
+            Timeout.InfiniteTimeSpan);
+
+        lock (_eventQueueGate)
+        {
+            if (_hrTimers.TryAdd(key, timer))
+            {
+                timer.Change(delay, Timeout.InfiniteTimeSpan);
+                return;
+            }
+        }
+
+        timer.Dispose();
+    }
+
+    private static void CancelHrTimer(ulong handle, ulong ident)
+    {
+        Timer? timer;
+        lock (_eventQueueGate)
+        {
+            if (!_hrTimers.Remove((handle, ident), out timer))
+            {
+                return;
+            }
+        }
+
+        timer.Dispose();
     }
 
     [SysAbiExport(
@@ -1035,15 +1183,17 @@ public static class KernelEventQueueCompatExports
     }
 
     /// <summary>
-    /// Triggers every registered event on every queue that matches <paramref name="filter"/>
-    /// regardless of the registration's <c>ident</c>. This is a workaround for PS5 AGC command
-    /// buffers, where <c>IT_EVENT_WRITE</c> carries a hardware <c>EVENT_TYPE</c> that does not
-    /// match the <c>eventId</c> the guest registered with <c>sceAgcDriverAddEqEvent</c>.
-    /// See issue #173.
+    /// Queues one event per matching registration for an end-of-pipe interrupt.
+    /// <paramref name="ident"/> is the queue that raised it: hardware routes an
+    /// interrupt to the registration made for that queue, so a compute queue's
+    /// interrupt must not wake a registration made for the graphics queue.
+    /// Pass <see langword="null"/> to reach every registration on the filter,
+    /// which is only right when the raiser genuinely has no queue identity.
     /// </summary>
     public static int TriggerRegisteredEventsByFilter(
         short filter,
-        ulong data)
+        ulong data,
+        ulong? ident = null)
     {
         List<EventQueueState>? wakeQueues = null;
         var triggeredCount = 0;
@@ -1060,6 +1210,11 @@ public static class KernelEventQueueCompatExports
                 foreach (var registration in registrations.Values)
                 {
                     if (registration.Filter != filter)
+                    {
+                        continue;
+                    }
+
+                    if (ident is { } requiredIdent && registration.Ident != requiredIdent)
                     {
                         continue;
                     }

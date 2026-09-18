@@ -268,6 +268,131 @@ public sealed class FiberExportsTests
     }
 
     [Fact]
+    public void Run_ResumedOnAnotherThread_KeepsTheResumingThreadsPointer()
+    {
+        // A fiber switch saves registers, stack and FPU state, never fs: the
+        // thread pointer belongs to the kernel thread, so a fiber suspended on one
+        // thread runs with the TLS of whichever thread resumes it. GT7's job system
+        // migrates fibers between workers and re-attaches its own TLS job state
+        // around the switch; a continuation that brought the suspending worker's fs
+        // along made two workers share that state (docs/gt7 blocker E).
+        const ulong threadA = 0xA1;
+        const ulong threadB = 0xB2;
+        const ulong fsA = 0x7FFD_FD30_0000UL;
+        const ulong fsB = 0x7FFD_FD40_0000UL;
+        const ulong suspendRip = 0x4_0000_3000UL;
+        var memory = new FakeCpuMemory(Base, RegionSize);
+        var context = new CpuContext(memory, Generation.Gen5);
+        var previousScheduler = GuestThreadExecution.Scheduler;
+        GuestThreadExecution.Scheduler = new ContextTransferScheduler();
+        try
+        {
+            WriteCString(memory, NameAddress, "Job");
+            context[CpuRegister.Rdi] = FiberAddress;
+            context[CpuRegister.Rsi] = NameAddress;
+            context[CpuRegister.Rdx] = EntryAddress;
+            context[CpuRegister.Rcx] = 0;
+            context[CpuRegister.R8] = ContextAddress;
+            context[CpuRegister.R9] = 0x1000;
+            Assert.Equal(0, FiberExports.FiberInitialize(context));
+
+            // Thread A runs the fiber, which then returns to its thread. Its stack
+            // pointers stay outside the fiber's context so only explicit fiber
+            // tracking decides which fiber is current.
+            _ = GuestThreadExecution.EnterGuestThread(threadA);
+            context.FsBase = fsA;
+            context[CpuRegister.Rsp] = Base + 0x1C00;
+            context[CpuRegister.Rbp] = 0;
+            _ = GuestThreadExecution.EnterImportCallFrame(0x4_0000_2000UL, Base + 0x1C00, Base + 0x1BF8);
+            context[CpuRegister.Rdi] = FiberAddress;
+            context[CpuRegister.Rsi] = 0;
+            context[CpuRegister.Rdx] = 0;
+            Assert.Equal(0, FiberExports.FiberRun(context));
+            Assert.True(GuestThreadExecution.TryConsumeCurrentContextTransfer(out _));
+
+            _ = GuestThreadExecution.EnterImportCallFrame(suspendRip, Base + 0x1C00, Base + 0x1BF8);
+            context[CpuRegister.Rdi] = 0;
+            context[CpuRegister.Rsi] = 0;
+            Assert.Equal(0, FiberExports.FiberReturnToThread(context));
+            Assert.True(GuestThreadExecution.TryConsumeCurrentContextTransfer(out _));
+
+            // Thread B resumes it.
+            _ = GuestThreadExecution.EnterGuestThread(threadB);
+            _ = GuestThreadExecution.EnterFiber(0);
+            context.FsBase = fsB;
+            _ = GuestThreadExecution.EnterImportCallFrame(0x4_0000_4000UL, Base + 0x1C00, Base + 0x1BF8);
+            context[CpuRegister.Rdi] = FiberAddress;
+            context[CpuRegister.Rsi] = 0;
+            context[CpuRegister.Rdx] = 0;
+            Assert.Equal(0, FiberExports.FiberRun(context));
+            Assert.True(GuestThreadExecution.TryConsumeCurrentContextTransfer(out var resume));
+
+            Assert.Equal(suspendRip, resume.Rip);
+            // Zero leaves the resuming thread's fs in place when the transfer is
+            // applied; thread A's pointer must not travel with the fiber.
+            Assert.NotEqual(fsA, resume.FsBase);
+            Assert.Equal(0UL, resume.FsBase);
+            Assert.Equal(0UL, resume.GsBase);
+        }
+        finally
+        {
+            GuestThreadExecution.RestoreFiber(0);
+            GuestThreadExecution.RestoreGuestThread(0);
+            GuestThreadExecution.Scheduler = previousScheduler;
+        }
+    }
+
+    private sealed class ContextTransferScheduler : IGuestThreadScheduler
+    {
+        public bool SupportsGuestContextTransfer => true;
+
+        public void RegisterGuestThreadContext(ulong threadHandle, CpuContext context)
+        {
+        }
+
+        public bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error) =>
+            throw new NotSupportedException();
+
+        public bool TryJoinThread(CpuContext callerContext, ulong threadHandle, out ulong returnValue, out string? error) =>
+            throw new NotSupportedException();
+
+        public void Pump(CpuContext callerContext, string reason)
+        {
+        }
+
+        public int WakeBlockedThreads(string wakeKey, int maxCount = int.MaxValue) => 0;
+
+        public bool TrySetGuestThreadPriority(ulong guestThreadHandle, int guestPriority) => false;
+
+        public bool TrySetGuestThreadAffinity(ulong guestThreadHandle, ulong affinityMask) => false;
+
+        public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads() => [];
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext, ulong entryPoint, ulong arg0, ulong arg1,
+            ulong stackAddress, ulong stackSize, string reason, out string? error) =>
+            throw new NotSupportedException();
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext, ulong entryPoint, ulong arg0, ulong arg1, ulong arg2,
+            ulong stackAddress, ulong stackSize, string reason, out ulong returnValue, out string? error) =>
+            throw new NotSupportedException();
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext, ulong entryPoint, ulong arg0, ulong arg1, ulong arg2, ulong arg3,
+            ulong stackAddress, ulong stackSize, string reason, out ulong returnValue, out string? error) =>
+            throw new NotSupportedException();
+
+        public bool TryCallGuestContinuation(
+            CpuContext callerContext, GuestCpuContinuation continuation, string reason, out string? error) =>
+            throw new NotSupportedException();
+
+        public bool TryRaiseGuestException(
+            CpuContext callerContext, ulong threadHandle, ulong handler, int exceptionType, out string? error) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
     public void GetInfo_WrongSize_ReturnsInvalidError()
     {
         var memory = new FakeCpuMemory(Base, RegionSize);

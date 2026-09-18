@@ -148,6 +148,35 @@ public static class AppContentExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Same contract as the download-data sibling above, for the temporary-data
+    // mount. Leaving it unresolved returns NOT_FOUND and writes nothing, so a
+    // title that sizes its scratch storage before using it reads an untouched
+    // output buffer and can take a "no space" path it never recovers from.
+    [SysAbiExport(
+        Nid = "SaKib2Ug0yI",
+        ExportName = "sceAppContentTemporaryDataGetAvailableSpaceKb",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataGetAvailableSpaceKb(CpuContext ctx)
+    {
+        const ulong availableSpaceKb = 1024UL * 1024UL; // 1 GiB
+        var availableSpaceAddress = ctx[CpuRegister.Rsi];
+        if (availableSpaceAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> spaceBytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceBytes, availableSpaceKb);
+        if (!ctx.Memory.TryWrite(availableSpaceAddress, spaceBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static bool TryReadUserDefinedParam(uint paramId, out int value)
     {
         value = 0;

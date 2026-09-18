@@ -23,6 +23,106 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ---
 
+## This is purely an AI slop test to see how far GPT/Claude could get. Most of this is likely crap.
+
+## Gran Turismo 7 — Boot Progress
+
+Captured on this branch, in order, from first present through the opening wizard
+to the car carousel.
+
+|                                         |                                            |
+| :-------------------------------------: | :----------------------------------------: |
+| ![](./gt7-screens/01-first-present.png) |  ![](./gt7-screens/02-dialogs-cleared.png) |
+| ![](./gt7-screens/03-wizard-step01.png) |   ![](./gt7-screens/04-wizard-step02.png)  |
+| ![](./gt7-screens/05-wizard-step03.png) |     ![](./gt7-screens/06-carousel.png)     |
+|   ![](./gt7-screens/07-first-tile.png)  | ![](./gt7-screens/08-after-select-10s.png) |
+
+
+
+## New Debug & Diagnostic Options
+
+> [!NOTE]
+> This branch adds **27 new `SHARPEMU_*` environment options**. All are opt-in
+> diagnostics — set them in the environment before launching, e.g.
+> `$env:SHARPEMU_LOG_PAD = 1` (PowerShell) or `SHARPEMU_LOG_PAD=1` (sh).
+
+<details>
+<summary><b>Memory / address space</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_RESERVE_GUEST_VA` | `1` | Reserves the PS5 guest window in the child process so host allocations can't block guest fixed mappings. |
+| `SHARPEMU_GUEST_VA_RESERVATION` | *(internal)* | Carries the promised windows launcher → child. Not set by hand. |
+| `SHARPEMU_LOG_SHARED_BACKING` | `1` | Shared direct-memory backing: view maps, partial unmaps, remaps. |
+| `SHARPEMU_LOG_PLACEHOLDER` | `1` | Placeholder reserve/split/commit in the guest window. |
+
+</details>
+
+<details>
+<summary><b>Breakpoints &amp; watches</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_WATCH_GUEST_WRITE` | `<hex>[:1\|2\|4\|8]` | Hardware write watch — names the guest RIP that stored there. Takes `[ptr]+off` deref specs. |
+| `SHARPEMU_WATCH_GUEST_EXEC` | `<hex>` | Hardware execute breakpoint; answers "does this run, and who calls it" for vtable-reached code. |
+| `SHARPEMU_WATCH_GUEST_EXEC_PROBE` | `[rdi+8],[[rdi+8]]+F8` | Deref specs read at each exec hit — resolves a gate flag several hops out in one run instead of a boot per hop. |
+| `SHARPEMU_WATCH_GUEST_EXEC_RING` | `=<entries>` | Records every exec hit to a bounded ring, printed only on exception/stall. For hot sites where printing changes timing. |
+| `SHARPEMU_BREAK_GUEST_EXEC` | `<hex>[,<hex>…]` | `0xCC` patch, fires once per address then restores. Answers "does this ever run" where debug registers can't. |
+| `SHARPEMU_WATCH_GUEST_OBJECT` | `<hex>` | Logs every import handed that guest pointer in any argument register. |
+
+</details>
+
+<details>
+<summary><b>Memory inspection</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_DUMP_GUEST_MEMORY` | `<hex>` or `rbx-0x28[:<hexlen>]` | Dumps bytes at each stall snapshot. Register-relative form handles objects that move every boot. |
+| `SHARPEMU_FIND_GUEST_POINTER` | same spec form | One-shot sweep for who holds a pointer. Hits on one thread stack only ⇒ nothing ever registered it. |
+| `SHARPEMU_CRASH_DUMP_DIR` | `<path>` | One full-memory minidump from the native-exception handler. Analyse with `cdb -z`. |
+
+</details>
+
+<details>
+<summary><b>Sync tracing</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_TRACE_SYNC_COND` | `<hex>,…` | Condvar addresses → bounded ring of wait/signal/wake/exit, printed only on exception or stall. |
+| `SHARPEMU_TRACE_SYNC_SEMA` | `<handle>,…` | Same for semaphore handles. |
+| `SHARPEMU_LOG_PTHREAD_COND_SITE` | `<hex retaddr>` | Filter condvar logging by caller return address — traces one wait/signal pair without `LOG_PTHREAD_CONDS` volume. |
+| `SHARPEMU_LOG_PTHREAD_COND_WAKE` | `1` | Signalled waiter that can't re-acquire its mutex at wake. Measured 124,525 waiters ⇒ opt-in, not a standing warning. |
+
+</details>
+
+<details>
+<summary><b>Graphics</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_LOG_AGC_LABELS` | `1` | Label writes only (`release_mem`, `write_data`, rewind patch) — shows a cross-queue wait cycle without a full packet trace. |
+| `SHARPEMU_TRACE_TEXTURE_BIND_ADDRESS` | `<hex>` | Texture binds in the MiB above it, and which upload path each took. |
+| `SHARPEMU_TRACE_MOVIE_TEXTURE` | `<hex>` | Base of the decoded-video ring; logs the whole image-binding group of any draw within 64 MiB, exposing a bad sibling descriptor. |
+
+</details>
+
+<details>
+<summary><b>Input / subsystems</b></summary>
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `SHARPEMU_AUTO_PAD` | `40:cross,44:right,48:cross` | Holds each button 0.4 s at that second-offset from process start. Any button name. |
+| `SHARPEMU_LOG_PAD` | `1` | Pad state and button changes. |
+| `SHARPEMU_LOG_FONT` | `1` | Which handles carry parsed outlines, what each glyph render resolved to. |
+| `SHARPEMU_LOG_DEVICE_SERVICE` | `1` | DeviceService trace. |
+| `SHARPEMU_LOG_IMPORT_CENSUS` | `1` | The distinct set of exports a title actually called. |
+| `SHARPEMU_IMPORT_TRACE_DEPTH` | `<n>` | Import ring depth, clamped 64–262144. The call that set a deadlock up is usually well before the one that parked. |
+| `SHARPEMU_AVPLAYER_HOLD_BEFORE_CLOSE_MS` | `<ms>` | Temp diagnostic, marked "revert before commit" — keeps the guest file object alive for a live read. |
+
+</details>
+
+---
+
 > [!NOTE]  
 > SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
 > can run the macOS x64 build through Rosetta 2, and Windows on ARM devices

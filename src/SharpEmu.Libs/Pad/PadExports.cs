@@ -5,6 +5,7 @@ using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Threading;
 
 namespace SharpEmu.Libs.Pad;
 
@@ -301,6 +302,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        TracePadRead(handle);
         return WriteNeutralPadData(ctx, dataAddress)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -326,6 +328,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        TracePadRead(handle);
         return WriteNeutralPadData(ctx, dataAddress)
             ? ctx.SetReturn(1)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -739,6 +742,8 @@ public static class PadExports
             buttons |= 0x4000;
         }
 
+        buttons |= AutoPadButtons();
+
         _cachedInputState = new PadState(
             Connected: true,
             Buttons: buttons,
@@ -753,7 +758,53 @@ public static class PadExports
             Motion: motion,
             Touch: touch);
         _lastInputSampleTicks = now;
+        TracePadState(_cachedInputState, acceptsKeyboardInput, gamepadCount);
         return _cachedInputState;
+    }
+
+    private static readonly bool PadTraceEnabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD"),
+        "1",
+        StringComparison.Ordinal);
+    private static uint _tracedPadButtons;
+    private static bool _tracedPadFocus;
+
+    // Without this there is no way to tell "the host key never reached the
+    // guest" from "the guest ignored it": a menu that will not advance looks
+    // the same either way. Logs only on a change, so a held button is one line.
+    private static void TracePadState(PadState state, bool windowFocused, int gamepadCount)
+    {
+        if (!PadTraceEnabled ||
+            (state.Buttons == _tracedPadButtons && windowFocused == _tracedPadFocus))
+        {
+            return;
+        }
+
+        _tracedPadButtons = state.Buttons;
+        _tracedPadFocus = windowFocused;
+        Console.Error.WriteLine(
+            $"[PAD][TRACE] buttons=0x{state.Buttons:X4} focus={windowFocused} " +
+            $"gamepads={gamepadCount} lx={state.LeftX} ly={state.LeftY} " +
+            $"l2={state.L2} r2={state.R2}");
+    }
+
+    // Counts how often the guest actually samples the pad, so a menu that does
+    // not react can be separated from one that is not reading the pad at all.
+    private static long _padReadCount;
+
+    private static void TracePadRead(int handle)
+    {
+        if (!PadTraceEnabled)
+        {
+            return;
+        }
+
+        var count = Interlocked.Increment(ref _padReadCount);
+        if (count is 1 or 100 or 1000 or 10000 or 100000)
+        {
+            Console.Error.WriteLine(
+                $"[PAD][TRACE] guest_reads={count} handle={handle}");
+        }
     }
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
@@ -779,6 +830,80 @@ public static class PadExports
         }
 
         return values.ToArray();
+    }
+
+    // SHARPEMU_AUTO_PAD="40:cross,44:right,48:cross": holds each button for
+    // 0.4s at the given second offset from process start. The Cross-only aid
+    // above cannot drive menus that need a direction first (GT7's first-boot
+    // display calibration), so this takes any button name.
+    private static readonly (double Time, uint Buttons)[] AutoPadPresses = ParseAutoPadPresses();
+
+    private static (double Time, uint Buttons)[] ParseAutoPadPresses()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_PAD");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return [];
+        }
+
+        var presses = new List<(double, uint)>();
+        foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = token.Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 ||
+                !double.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture, out var time))
+            {
+                continue;
+            }
+
+            var buttons = 0u;
+            foreach (var name in parts[1].Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                buttons |= name.ToLowerInvariant() switch
+                {
+                    "cross" or "x" => 0x4000u,
+                    "circle" or "o" => 0x2000u,
+                    "square" => 0x8000u,
+                    "triangle" => 0x1000u,
+                    "up" => 0x10u,
+                    "right" => 0x20u,
+                    "down" => 0x40u,
+                    "left" => 0x80u,
+                    "options" or "start" => 0x8u,
+                    "l1" => 0x400u,
+                    "r1" => 0x800u,
+                    _ => 0u,
+                };
+            }
+
+            if (buttons != 0)
+            {
+                presses.Add((time, buttons));
+            }
+        }
+
+        return presses.ToArray();
+    }
+
+    private static uint AutoPadButtons()
+    {
+        var presses = AutoPadPresses;
+        if (presses.Length == 0)
+        {
+            return 0;
+        }
+
+        var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
+        var buttons = 0u;
+        foreach (var (time, mask) in presses)
+        {
+            if (elapsed >= time && elapsed < time + 0.4)
+            {
+                buttons |= mask;
+            }
+        }
+
+        return buttons;
     }
 
     private static bool IsAutoCrossActive()

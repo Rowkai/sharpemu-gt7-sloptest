@@ -212,6 +212,37 @@ public sealed class KernelMemoryCompatExportsTests
         }
     }
 
+    [Theory]
+    [InlineData(0x1_8080_0002UL, 0x6_007F_FE32UL)] // GT7's malformed call: neither is a 16 KiB multiple
+    [InlineData(0x0020_0000UL, 0x6_007F_FE32UL)]   // valid length, misaligned alignment
+    [InlineData(0x0020_0002UL, 0UL)]               // misaligned length, default alignment
+    public void AllocateDirectMemory_RejectsLengthOrAlignmentOffPageBoundary(ulong length, ulong alignment)
+    {
+        var context = new CpuContext(new FakeCpuMemory(GuestMemoryBase, 0x1000), Generation.Gen5);
+        Assert.True(context.TryWriteUInt64(AllocationOutAddress, 0xDEAD_BEEFUL));
+
+        context[CpuRegister.Rdi] = 0;
+        context[CpuRegister.Rsi] = 0x3_4400_0000;
+        context[CpuRegister.Rdx] = length;
+        context[CpuRegister.Rcx] = alignment;
+        context[CpuRegister.R8] = 0xC;
+        context[CpuRegister.R9] = AllocationOutAddress;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            KernelMemoryCompatExports.KernelAllocateDirectMemory(context));
+
+        context[CpuRegister.Rdi] = length;
+        context[CpuRegister.Rsi] = alignment;
+        context[CpuRegister.Rdx] = 0xC;
+        context[CpuRegister.Rcx] = AllocationOutAddress;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            KernelMemoryCompatExports.KernelAllocateMainDirectMemory(context));
+
+        Assert.True(context.TryReadUInt64(AllocationOutAddress, out var untouched));
+        Assert.Equal(0xDEAD_BEEFUL, untouched);
+    }
+
     private static void AllocateDirectMemory(CpuContext context, ulong start, ulong length)
     {
         context[CpuRegister.Rdi] = start;

@@ -76,6 +76,110 @@ public sealed partial class DirectExecutionBackend
 		SetUnhandledExceptionFilter(_unhandledFilterStub);
 	}
 
+	// SHARPEMU_CRASH_DUMP_DIR=<directory> writes one full-memory dump when the
+	// handler gives up on a native exception. Neither Windows Error Reporting nor
+	// the runtime's createdump produce a dump for these faults (the process ends
+	// after the handler returns), so the dump has to be taken here, while the
+	// faulting thread and every guest thread are still live. MiniDumpWriteDump
+	// must not run on the thread it describes, so a helper thread writes it with
+	// this thread's exception pointers while this thread waits.
+	private static readonly string? _crashDumpDirectory =
+		Environment.GetEnvironmentVariable("SHARPEMU_CRASH_DUMP_DIR");
+
+	private static int _crashDumpStarted;
+
+	[StructLayout(LayoutKind.Sequential, Pack = 4)]
+	private struct CrashDumpExceptionInformation
+	{
+		public uint ThreadId;
+		public nint ExceptionPointers;
+		public int ClientPointers;
+	}
+
+	private unsafe static void TryWriteCrashDump(void* exceptionInfo)
+	{
+		if (string.IsNullOrWhiteSpace(_crashDumpDirectory) || !OperatingSystem.IsWindows())
+		{
+			return;
+		}
+
+		// Resumable debug traps reach this path before the write/exec watch handler
+		// claims them on the title's main thread. They are not crashes: dumping on
+		// one wrote a 15 GB dump mid-run (race51), perturbing timing and using up the
+		// single dump before the real fault.
+		var exceptionCode = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord->ExceptionCode;
+		if (exceptionCode == 0x80000004u || exceptionCode == 0x80000003u)
+		{
+			return;
+		}
+
+		if (Interlocked.Exchange(ref _crashDumpStarted, 1) != 0)
+		{
+			return;
+		}
+
+		var faultingThreadId = GetCurrentThreadId();
+		var exceptionPointers = (nint)exceptionInfo;
+		var path = Path.Combine(_crashDumpDirectory, $"crash-{Environment.ProcessId}-{faultingThreadId}.dmp");
+		Console.Error.WriteLine($"[LOADER][INFO] Writing full crash dump: {path}");
+		Console.Error.Flush();
+
+		var result = "not written";
+		var writer = new Thread(() =>
+		{
+			try
+			{
+				Directory.CreateDirectory(_crashDumpDirectory);
+				using var file = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+				var information = new CrashDumpExceptionInformation
+				{
+					ThreadId = faultingThreadId,
+					ExceptionPointers = exceptionPointers,
+					ClientPointers = 0,
+				};
+				// FullMemory | HandleData | UnloadedModules | FullMemoryInfo |
+				// ThreadInfo | IgnoreInaccessibleMemory
+				const uint dumpType = 0x2 | 0x4 | 0x20 | 0x800 | 0x1000 | 0x20000;
+				result = CrashDumpMiniDumpWriteDump(
+						CrashDumpGetCurrentProcess(),
+						(uint)Environment.ProcessId,
+						file.SafeFileHandle.DangerousGetHandle(),
+						dumpType,
+						&information,
+						0,
+						0)
+					? $"ok size={file.Length}"
+					: $"MiniDumpWriteDump failed: {Marshal.GetLastWin32Error()}";
+			}
+			catch (Exception exception)
+			{
+				result = exception.GetType().Name + ": " + exception.Message;
+			}
+		})
+		{
+			IsBackground = true,
+			Name = "SharpEmu-CrashDump",
+		};
+		writer.Start();
+		var finished = writer.Join(TimeSpan.FromMinutes(10));
+		Console.Error.WriteLine($"[LOADER][INFO] Crash dump {(finished ? "finished" : "timed out")}: {result}");
+		Console.Error.Flush();
+	}
+
+	[DllImport("dbghelp.dll", EntryPoint = "MiniDumpWriteDump", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private unsafe static extern bool CrashDumpMiniDumpWriteDump(
+		nint process,
+		uint processId,
+		nint file,
+		uint dumpType,
+		CrashDumpExceptionInformation* exceptionParam,
+		nint userStreamParam,
+		nint callbackParam);
+
+	[DllImport("kernel32.dll", EntryPoint = "GetCurrentProcess")]
+	private static extern nint CrashDumpGetCurrentProcess();
+
 	private unsafe int UnhandledExceptionFilter(void* exceptionInfo)
 	{
 		try
@@ -99,6 +203,36 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe int VectoredHandler(void* exceptionInfo)
 	{
+		// The exec-break probe is handled ahead of the nested-exception guard.
+		// A hot function's int3 can land while another exception (a lazy-commit
+		// fault, say) is already being serviced, and the guard below returns 0
+		// for anything nested — which leaves the breakpoint unhandled and kills
+		// the process. This runs first because it is reentrancy-safe: it only
+		// compares RIP against a small static array, restores one byte and
+		// rewinds RIP. No allocation, no locks, no logging before the match.
+		{
+			var breakRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
+			var breakContext = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
+			if (breakRecord != null && breakContext != null &&
+				TryReportGuestExecBreak(
+					breakRecord->ExceptionCode,
+					breakContext,
+					ReadCtxU64(breakContext, 248)))
+			{
+				return -1;
+			}
+		}
+
+		// Hardware watch traps belong to the raw handler, but this handler is
+		// registered later at the head of the chain and so sees them first. Left
+		// alone, it prints a full native-exception report for every trap, which on
+		// a hot execute site is most of the run's work. Claim them here, before
+		// the nested guard, for the same reason as the exec-break probe above.
+		if (TryHandleGuestWriteWatch(exceptionInfo))
+		{
+			return -1;
+		}
+
 		if (_vectoredHandlerDepth > 0)
 		{
 			LogNestedVectoredException(exceptionInfo);
@@ -447,8 +581,18 @@ public sealed partial class DirectExecutionBackend
 					break;
 			}
 
+			// Watch traps (single-step, breakpoint) are logged here too but are not
+			// failures: dumping the rings on each one prints a hot watch site entry by
+			// entry and costs every hit the time the ring exists to avoid.
+			if (exceptionCode is not (0x80000004u or 0x80000003u))
+			{
+				SharpEmu.HLE.SyncTraceRing.Dump("native-exception");
+				DumpGuestExecWatchRing("native-exception");
+			}
+
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.Flush();
+			TryWriteCrashDump(exceptionInfo);
 			return 0;
 		}
 		finally
@@ -1556,8 +1700,19 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+		// A partial unmap of shared direct memory tears a view down and remaps its
+		// survivors; a thread touching one of them in that window faults on a hole
+		// that is about to be filled. Wait for the remap and retry the
+		// instruction. The wait is lock-free, allocation-free and bounded, so a
+		// remap that never completes falls through to the ordinary paths below
+		// rather than parking the thread.
+		if (SharpEmu.HLE.Host.GuestSharedBacking.WaitForPendingRemap(faultAddress))
+		{
+			return true;
+		}
 		if (!IsGuestOwnedLazyCommitAddress(faultAddress, out var owner))
 		{
+			ReportDeclinedLazyCommit(faultAddress, accessType, rip);
 			return false;
 		}
 		if (VirtualQuery((void*)faultAddress, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
@@ -1641,6 +1796,21 @@ public sealed partial class DirectExecutionBackend
 		if (mbi.State != 8192)
 		{
 			return false;
+		}
+
+		// A placeholder from the launcher's guest-window reservation cannot be
+		// committed in place: it has to be replaced with private memory. Raw
+		// Win32 only in here — no locks, no allocation.
+		if (SharpEmu.HLE.Host.GuestPlaceholder.TryClaimForFault(faultAddress, commitProtect, out var claimedBase, out var claimedSize))
+		{
+			RescanTlsPatternsIfExecutable(claimedBase, claimedSize, commitProtect);
+			if (traceLazyCommit)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] lazy-placeholder-claim#{traceIndex}: addr=0x{claimedBase:X16} size=0x{claimedSize:X16} protect=0x{commitProtect:X8}");
+			}
+
+			return true;
 		}
 
 		if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var commitWindowBase, out var commitWindowSize) &&
@@ -1802,6 +1972,209 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		PatchTlsPatternsInRange(committedBase, committedBase + committedSize, announce: false);
+	}
+
+	// A declined fault becomes a fatal access violation, so when the lazy-commit
+	// handler turns one down it is worth being able to see why: an address the
+	// guest owns that is not in any tracked region reads exactly like a genuine
+	// guest bug in the crash dump.
+	private unsafe void ReportDeclinedLazyCommit(ulong faultAddress, ulong accessType, ulong rip)
+	{
+		if (!string.Equals(
+			    Environment.GetEnvironmentVariable("SHARPEMU_LOG_LAZY_COMMIT"),
+			    "1",
+			    StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		var context = ActiveCpuContext;
+		var regionCount = -1;
+		if (context != null && TryGetVirtualMemory(context, out var virtualMemory))
+		{
+			regionCount = virtualMemory.SnapshotRegions().Count;
+		}
+
+		var state = "unqueried";
+		if (VirtualQuery((void*)faultAddress, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
+		{
+			state = $"state=0x{mbi.State:X8} base=0x{mbi.BaseAddress:X16} " +
+				$"size=0x{mbi.RegionSize:X} alloc=0x{mbi.AllocationProtect:X8} prot=0x{mbi.Protect:X8}";
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] lazy-commit-declined: fault=0x{faultAddress:X16} access={accessType} " +
+			$"rip=0x{rip:X16} context={(context is null ? "none" : "active")} vmem_regions={regionCount} {state}");
+	}
+
+	// One-shot execution probe that works on ANY guest thread.
+	//
+	// The debug-register watches (SHARPEMU_WATCH_GUEST_EXEC / _WRITE) are armed
+	// per thread and only on *registered* guest threads, so they are blind to
+	// the title's main thread: watching a function main is provably parked
+	// inside yields zero hits. That has produced at least one wrong "this code
+	// never executes" conclusion. The vectored handler, by contrast, is
+	// process-wide, so an int3 planted in guest code reports from every thread.
+	//
+	// SHARPEMU_BREAK_GUEST_EXEC=<hex address>[,<hex address>...]
+	//
+	// Each address is patched once with 0xCC. On the first trap the original
+	// byte is restored and RIP is rewound, so the guest resumes unmodified and
+	// the site fires exactly once — enough to answer "does this ever run", which
+	// is the question the debug-register watches cannot answer for main.
+	private static readonly ulong[] GuestExecBreakAddresses = ParseGuestExecBreaks();
+	private static readonly byte[] GuestExecBreakOriginalBytes =
+		new byte[GuestExecBreakAddresses.Length];
+	private static int _guestExecBreaksArmed;
+
+	private static ulong[] ParseGuestExecBreaks()
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_BREAK_GUEST_EXEC");
+		if (string.IsNullOrWhiteSpace(spec))
+		{
+			return [];
+		}
+
+		var parts = spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+		var addresses = new List<ulong>(parts.Length);
+		foreach (var part in parts)
+		{
+			var text = part.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? part[2..] : part;
+			if (ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address) &&
+				address != 0)
+			{
+				addresses.Add(address);
+			}
+		}
+
+		return [.. addresses];
+	}
+
+	internal unsafe void EnsureGuestExecBreaks()
+	{
+		if (GuestExecBreakAddresses.Length == 0 ||
+			Interlocked.Exchange(ref _guestExecBreaksArmed, 1) != 0)
+		{
+			return;
+		}
+
+		for (var index = 0; index < GuestExecBreakAddresses.Length; index++)
+		{
+			var address = GuestExecBreakAddresses[index];
+			var target = (byte*)address;
+			uint oldProtect = 0;
+			if (!VirtualProtect(target, 1, 0x40 /* PAGE_EXECUTE_READWRITE */, &oldProtect))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] guest-exec-break: cannot unprotect 0x{address:X16}");
+				continue;
+			}
+
+			GuestExecBreakOriginalBytes[index] = *target;
+			*target = 0xCC;
+			VirtualProtect(target, 1, oldProtect, &oldProtect);
+			FlushInstructionCache(GetCurrentProcess(), target, 1);
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] guest-exec-break armed at 0x{address:X16} " +
+				$"(original byte 0x{GuestExecBreakOriginalBytes[index]:X2})");
+		}
+
+		Console.Error.Flush();
+	}
+
+	private unsafe bool TryReportGuestExecBreak(uint exceptionCode, void* contextRecord, ulong rip)
+	{
+		// Measured on this handler: the context reports RIP *at* the trapping
+		// int3, not after it. Both forms are accepted so the probe does not
+		// depend on that detail.
+		if (exceptionCode != 0x80000003u || GuestExecBreakAddresses.Length == 0)
+		{
+			return false;
+		}
+
+		for (var index = 0; index < GuestExecBreakAddresses.Length; index++)
+		{
+			var hit = GuestExecBreakAddresses[index];
+			if (hit != rip && hit != rip - 1)
+			{
+				continue;
+			}
+
+			var target = (byte*)hit;
+			uint oldProtect = 0;
+			if (VirtualProtect(target, 1, 0x40, &oldProtect))
+			{
+				*target = GuestExecBreakOriginalBytes[index];
+				VirtualProtect(target, 1, oldProtect, &oldProtect);
+				FlushInstructionCache(GetCurrentProcess(), target, 1);
+			}
+
+			WriteCtxU64(contextRecord, 248, hit);
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] guest-exec-break HIT 0x{hit:X16} " +
+				$"tid={GetCurrentThreadId()} managed={Environment.CurrentManagedThreadId} " +
+				$"rdi=0x{ReadCtxU64(contextRecord, 176):X16} rsi=0x{ReadCtxU64(contextRecord, 168):X16} " +
+				$"rdx=0x{ReadCtxU64(contextRecord, 136):X16} rcx=0x{ReadCtxU64(contextRecord, 128):X16} " +
+				$"rbp=0x{ReadCtxU64(contextRecord, 160):X16} " +
+				$"rsp=0x{ReadCtxU64(contextRecord, 152):X16}");
+			DumpPointerWindow("guest-exec-break-stack", ReadCtxU64(contextRecord, 152), 0x40);
+
+			// A script-native receives its Adhoc argument array in rcx, and the
+			// first element names what it acts on (the project for
+			// getProjectByName, the page for startPage). Script objects are
+			// recycled within a frame or two, so it is decoded here, at trap
+			// time; a later read of the same address finds unrelated data.
+			if (TryReadQword(ReadCtxU64(contextRecord, 128), out var firstArgument))
+			{
+				DumpPointerWindow("guest-exec-break-arg0", firstArgument, 0x40);
+				ReportGuestExecBreakString("arg0", firstArgument);
+				if (TryReadQword(firstArgument, out var referent))
+				{
+					ReportGuestExecBreakString("arg0-referent", referent);
+				}
+			}
+
+			Console.Error.Flush();
+			return true;
+		}
+
+		return false;
+	}
+
+	// Adhoc string objects carry an MSVC-style string layout at +0x28: the
+	// data (inline while capacity is below 16, otherwise a pointer), length at
+	// +0x10 and capacity at +0x18. Bounded and best-effort: prints nothing for
+	// an object that is not shaped like that.
+	private void ReportGuestExecBreakString(string name, ulong objectAddress)
+	{
+		var layout = objectAddress + 0x28;
+		if (!TryReadQword(layout + 0x10, out var length) ||
+			!TryReadQword(layout + 0x18, out var capacity) ||
+			length == 0 || length > 128 || capacity < length)
+		{
+			return;
+		}
+
+		var data = layout;
+		if (capacity >= 16 && !TryReadQword(layout, out data))
+		{
+			return;
+		}
+
+		Span<byte> bytes = stackalloc byte[136];
+		for (var offset = 0; offset < (int)length; offset += 8)
+		{
+			if (!TryReadQword(data + (ulong)offset, out var chunk))
+			{
+				return;
+			}
+
+			System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(bytes[offset..], chunk);
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO]   guest-exec-break-{name} string: " +
+			$"\"{System.Text.Encoding.UTF8.GetString(bytes[..(int)length])}\"");
 	}
 
 	private static bool ShouldTraceLazyCommit(int traceIndex)

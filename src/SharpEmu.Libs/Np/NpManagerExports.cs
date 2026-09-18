@@ -197,6 +197,28 @@ public static class NpManagerExports
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    // Whether the user has a PSN account at all. Offline, no user does, so
+    // report false rather than leave the import unresolved (NOT_FOUND is not
+    // an answer a console gives).
+    [SysAbiExport(
+        Nid = "Oad3rvY-NJQ",
+        ExportName = "sceNpHasSignedUp",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpHasSignedUp(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var hasSignedUpAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || hasSignedUpAddress == 0)
+        {
+            return SetReturn(ctx, NpErrorInvalidArgument);
+        }
+
+        return ctx.Memory.TryWrite(hasSignedUpAddress, stackalloc byte[1])
+            ? SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
     [SysAbiExport(
         Nid = "e-ZuhGEoeC4",
         ExportName = "sceNpGetNpReachabilityState",

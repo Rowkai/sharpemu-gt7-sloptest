@@ -1212,6 +1212,9 @@ public static class Gen5ShaderTranslator
             0x369 => "VCvtPknormU16F32",
             0x36A => "VCvtPkU16U32",
             0x373 => "VMadU32U16",
+            // V_XAD_U32 (LLVM VOP3_Real_gfx10<0x345>): D = (S0 ^ S1) + S2.
+            // Tiling/swizzle address math uses it; GT7 has it in a compute kernel.
+            0x345 => "VXadU32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
             0x36D => "VAdd3U32",

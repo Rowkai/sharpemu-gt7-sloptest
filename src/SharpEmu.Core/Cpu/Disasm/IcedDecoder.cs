@@ -65,6 +65,13 @@ public static class IcedDecoder
         ArgumentNullException.ThrowIfNull(memory);
         var clampedLength = Math.Clamp(maxLen, 1, MaxInstructionBytes);
         var buffer = new byte[clampedLength];
+        if (memory.TryRead(rip, buffer))
+        {
+            bytes = buffer;
+            return true;
+        }
+
+        // Preserve the readable prefix when the instruction window crosses an unmapped page.
         Span<byte> oneByte = stackalloc byte[1];
         var readCount = 0;
         for (var i = 0; i < clampedLength; i++)
@@ -96,39 +103,7 @@ public static class IcedDecoder
     }
 
     public static bool TryReadGuestBytes(IVirtualMemory memory, ulong rip, int maxLen, out byte[] bytes)
-    {
-        ArgumentNullException.ThrowIfNull(memory);
-        var clampedLength = Math.Clamp(maxLen, 1, MaxInstructionBytes);
-        var buffer = new byte[clampedLength];
-        Span<byte> oneByte = stackalloc byte[1];
-        var readCount = 0;
-        for (var i = 0; i < clampedLength; i++)
-        {
-            if (!memory.TryRead(rip + (ulong)i, oneByte))
-            {
-                break;
-            }
-
-            buffer[readCount] = oneByte[0];
-            readCount++;
-        }
-
-        if (readCount == 0)
-        {
-            bytes = Array.Empty<byte>();
-            return false;
-        }
-
-        if (readCount == clampedLength)
-        {
-            bytes = buffer;
-            return true;
-        }
-
-        bytes = new byte[readCount];
-        Array.Copy(buffer, bytes, readCount);
-        return true;
-    }
+        => TryReadGuestBytes((ICpuMemory)memory, rip, maxLen, out bytes);
 
     public static string FormatBytes(ReadOnlySpan<byte> bytes)
     {

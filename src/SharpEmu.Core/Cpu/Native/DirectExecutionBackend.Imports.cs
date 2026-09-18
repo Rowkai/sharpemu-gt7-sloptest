@@ -72,6 +72,11 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe static int RawVectoredHandlerManaged(void* exceptionInfo)
 	{
+		if (TryHandleGuestWriteWatch(exceptionInfo))
+		{
+			return -1;
+		}
+
 		if (TryHandleGuestImageWriteFault(exceptionInfo))
 		{
 			return -1;
@@ -208,6 +213,8 @@ public sealed partial class DirectExecutionBackend
 		{
 			EnsureGuestRipSampler();
 		}
+		EnsureGuestWriteWatch();
+		EnsureGuestExecBreaks();
 		int num2 = Volatile.Read(in _rawSentinelRecoveries);
 		if (num2 != _lastReportedRawSentinelRecoveries)
 		{
@@ -259,6 +266,37 @@ public sealed partial class DirectExecutionBackend
 		ulong value8 = cpuContext[CpuRegister.R15];
 		ulong num7 = *(ulong*)(argPackPtr + 96);
 		var importStackPointer = (ulong)argPackPtr + 96;
+		// SHARPEMU_WATCH_GUEST_OBJECT=<hex>: log every import handed this guest
+		// pointer. Answers "does any thread besides the one I am looking at ever
+		// touch this object", which a deadlock investigation otherwise has to guess.
+		// SHARPEMU_LOG_IMPORT_CENSUS=1: record every distinct export a title
+		// actually calls. "Which of our stubs did this game rely on" is otherwise
+		// unanswerable without logging millions of dispatches.
+		if (_logImportCensus)
+		{
+			_importCensus.TryAdd(importStubEntry.Nid, 0);
+		}
+
+		// All six integer-argument registers, not just the first two: a pointer
+		// handed off as the third or fourth argument is exactly the case this is
+		// meant to catch, and checking only rdi/rsi silently answers "nothing
+		// touches it" when something does.
+		if (_watchGuestObject != 0 &&
+			(cpuContext[CpuRegister.Rdi] == _watchGuestObject ||
+			 cpuContext[CpuRegister.Rsi] == _watchGuestObject ||
+			 cpuContext[CpuRegister.Rdx] == _watchGuestObject ||
+			 cpuContext[CpuRegister.Rcx] == _watchGuestObject ||
+			 cpuContext[CpuRegister.R8] == _watchGuestObject ||
+			 cpuContext[CpuRegister.R9] == _watchGuestObject))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest-object-watch nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+				$"rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} " +
+				$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId}");
+		}
+
 		var probeTarget = (_probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress) ||
 			(string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
 			 importStackPointer >= 0x00006FFFAC1FF000UL &&
@@ -274,6 +312,7 @@ public sealed partial class DirectExecutionBackend
 				$"[LOADER][TRACE] import-return-address-probe " +
 				$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
 				$"nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+				$"rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
 				$"rsp=0x{(ulong)argPackPtr + 96:X16} rbp=0x{value4:X16} " +
 				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
 		}
@@ -591,6 +630,7 @@ public sealed partial class DirectExecutionBackend
 					CaptureImportBoundaryContinuation(cpuContext, argPackPtr, num7));
 			}
 			StoreImportVectorReturn(cpuContext, argPackPtr);
+			StoreImportPairReturn(cpuContext, argPackPtr);
 			if (dispatchResolved &&
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
 				string.Equals(importStubEntry.Nid, "BohYr-F7-is", StringComparison.Ordinal))
@@ -1232,6 +1272,18 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// SysV returns a 16-byte integer aggregate in RAX:RDX. The trampoline pops
+	// the guest's saved RDX out of the argument pack on the way out, so a second
+	// return eightbyte has to be written into that slot; left in the context it
+	// would be discarded.
+	private unsafe static void StoreImportPairReturn(CpuContext cpuContext, nint argPackPtr)
+	{
+		if (cpuContext.WasReturnPairWritten)
+		{
+			*(ulong*)(argPackPtr + 16) = cpuContext[CpuRegister.Rdx];
+		}
+	}
+
 	private unsafe static void StoreImportVectorReturn(CpuContext cpuContext, nint argPackPtr)
 	{
 		// AMD64 returns scalar/vector floating-point values in XMM0 and may use
@@ -1425,6 +1477,7 @@ public sealed partial class DirectExecutionBackend
 				CaptureImportBoundaryContinuation(cpuContext, argPackPtr, returnRip));
 		}
 		StoreImportVectorReturn(cpuContext, argPackPtr);
+		StoreImportPairReturn(cpuContext, argPackPtr);
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
 		{

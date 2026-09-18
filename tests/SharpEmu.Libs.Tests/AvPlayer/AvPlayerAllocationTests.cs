@@ -118,6 +118,25 @@ public sealed class AvPlayerAllocationTests : IDisposable
             return false;
         }
 
+        public bool TryCallGuestFunction(
+            CpuContext callerContext,
+            ulong entryPoint,
+            ulong arg0,
+            ulong arg1,
+            ulong arg2,
+            ulong arg3,
+            ulong stackAddress,
+            ulong stackSize,
+            string reason,
+            out ulong returnValue,
+            out string? error)
+        {
+            CallCount++;
+            returnValue = 0;
+            error = "allocator rejected the request";
+            return false;
+        }
+
         public bool TryCallGuestContinuation(
             CpuContext callerContext,
             GuestCpuContinuation continuation,

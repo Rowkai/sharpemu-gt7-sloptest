@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
-using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Cpu.Native;
@@ -15,8 +15,7 @@ namespace SharpEmu.Libs.Tests.Cpu;
 
 public sealed class Gen5NativeReturnSmokeTests
 {
-    private const string WorkerEnvironmentVariable = "SHARPEMU_NATIVE_RETURN_SMOKE_WORKER";
-    private static readonly TimeSpan WorkerTimeout = TimeSpan.FromSeconds(30);
+    private const ulong CallbackReturnValue = 0x1234_5678_9ABC_DEF0UL;
 
     [Fact]
     public async Task SyntheticGen5Entry_ReturnsToHost()
@@ -26,23 +25,36 @@ public sealed class Gen5NativeReturnSmokeTests
             return;
         }
 
-        if (string.Equals(
-                Environment.GetEnvironmentVariable(WorkerEnvironmentVariable),
-                "1",
-                StringComparison.Ordinal))
+        if (IsolatedTestWorker.IsWorker)
         {
             ExecuteSyntheticGuest();
             return;
         }
 
-        var result = await RunIsolatedWorker();
+        await IsolatedTestWorker.AssertPassesInIsolation(
+            typeof(Gen5NativeReturnSmokeTests),
+            nameof(SyntheticGen5Entry_ReturnsToHost));
+    }
 
-        Assert.True(
-            result.Completed,
-            $"native return worker did not exit within {WorkerTimeout.TotalSeconds:F0} seconds\n{result.Output}");
-        Assert.True(
-            result.ExitCode == 0,
-            $"native return worker exited with code {result.ExitCode}\n{result.Output}");
+    // An import-free callback never passes through import dispatch, so nothing
+    // but the native return boundary can carry its RAX back to the caller.
+    [Fact]
+    public async Task ImportFreeGuestCallback_ReturnsFull64BitRax()
+    {
+        if (!IsSupportedHost)
+        {
+            return;
+        }
+
+        if (IsolatedTestWorker.IsWorker)
+        {
+            ExecuteSyntheticCallbacks();
+            return;
+        }
+
+        await IsolatedTestWorker.AssertPassesInIsolation(
+            typeof(Gen5NativeReturnSmokeTests),
+            nameof(ImportFreeGuestCallback_ReturnsFull64BitRax));
     }
 
     private static bool IsSupportedHost =>
@@ -86,66 +98,47 @@ public sealed class Gen5NativeReturnSmokeTests
         Assert.Null(dispatcher.LastNotImplementedInfo);
     }
 
-    private static async Task<WorkerResult> RunIsolatedWorker()
+    private static void ExecuteSyntheticCallbacks()
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = ResolveDotnetHost(),
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        startInfo.ArgumentList.Add("test");
-        startInfo.ArgumentList.Add(typeof(Gen5NativeReturnSmokeTests).Assembly.Location);
-        startInfo.ArgumentList.Add("--filter");
-        startInfo.ArgumentList.Add(
-            $"FullyQualifiedName={typeof(Gen5NativeReturnSmokeTests).FullName}.{nameof(SyntheticGen5Entry_ReturnsToHost)}");
-        startInfo.Environment[WorkerEnvironmentVariable] = "1";
-        startInfo.Environment["SHARPEMU_SENTINEL_PROBE"] = null;
+        using var memory = new PhysicalVirtualMemory();
+        var moduleManager = new ModuleManager();
+        moduleManager.Freeze();
+        var backend = new DirectExecutionBackend(moduleManager);
+        var context = new CpuContext(memory, Generation.Gen5);
+        var code = memory.AllocateAt(0x0000_0008_0000_0000UL, 0x1000);
 
-        using var process = Process.Start(startInfo) ??
-            throw new InvalidOperationException("Could not start the isolated native return worker.");
-        var stdout = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEndAsync();
+        // Ordinary return: the callback returns straight into its entry stub.
+        var direct = new byte[11];
+        direct[0] = 0x48; direct[1] = 0xB8; // mov rax, imm64
+        BinaryPrimitives.WriteUInt64LittleEndian(direct.AsSpan(2), CallbackReturnValue);
+        direct[10] = 0xC3; // ret
+        Assert.True(memory.TryWrite(code, direct));
+        AssertCallbackReturnsValue(backend, context, code);
 
-        try
-        {
-            await process.WaitForExitAsync().WaitAsync(WorkerTimeout);
-        }
-        catch (TimeoutException)
-        {
-            process.Kill(entireProcessTree: true);
-            await process.WaitForExitAsync();
-            return new WorkerResult(false, process.ExitCode, await ReadOutput(stdout, stderr));
-        }
-
-        return new WorkerResult(true, process.ExitCode, await ReadOutput(stdout, stderr));
+        // Resumed continuations leave guest code through the shared guest return
+        // stub instead, which calls TlsGetValue before restoring the host stack.
+        var returnStub = (nint)typeof(DirectExecutionBackend)
+            .GetField("_guestReturnStub", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(backend)!;
+        Assert.NotEqual(0, returnStub);
+        var viaReturnStub = new byte[25];
+        viaReturnStub[0] = 0x48; viaReturnStub[1] = 0xB9; // mov rcx, imm64
+        BinaryPrimitives.WriteUInt64LittleEndian(viaReturnStub.AsSpan(2), (ulong)returnStub);
+        viaReturnStub[10] = 0x48; viaReturnStub[11] = 0x89; viaReturnStub[12] = 0x0C; viaReturnStub[13] = 0x24; // mov [rsp], rcx
+        viaReturnStub[14] = 0x48; viaReturnStub[15] = 0xB8; // mov rax, imm64
+        BinaryPrimitives.WriteUInt64LittleEndian(viaReturnStub.AsSpan(16), CallbackReturnValue);
+        viaReturnStub[24] = 0xC3; // ret
+        Assert.True(memory.TryWrite(code + 0x100, viaReturnStub));
+        AssertCallbackReturnsValue(backend, context, code + 0x100);
     }
 
-    private static string ResolveDotnetHost()
+    private static void AssertCallbackReturnsValue(DirectExecutionBackend backend, CpuContext context, ulong entry)
     {
-        var configuredHost = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
-        if (!string.IsNullOrWhiteSpace(configuredHost))
-        {
-            return configuredHost;
-        }
-
-        var processPath = Environment.ProcessPath;
-        if (processPath is not null &&
-            string.Equals(
-                Path.GetFileNameWithoutExtension(processPath),
-                "dotnet",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return processPath;
-        }
-
-        return "dotnet";
+        Assert.True(
+            backend.TryCallGuestFunction(context, entry, 0, 0, 0, 0, 0, 0, "synthetic-callback", out var returnValue, out var error),
+            error);
+        Assert.Equal(CallbackReturnValue, returnValue);
     }
-
-    private static async Task<string> ReadOutput(Task<string> stdout, Task<string> stderr) =>
-        await stdout + await stderr;
 
     private static byte[] BuildSyntheticElf()
     {
@@ -187,6 +180,4 @@ public sealed class Gen5NativeReturnSmokeTests
 
         return image;
     }
-
-    private sealed record WorkerResult(bool Completed, int ExitCode, string Output);
 }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Ampr;
 using SharpEmu.Libs.Media;
 using System.Buffers;
@@ -50,9 +51,16 @@ public static partial class KernelMemoryCompatExports
     private const int SeekSet = 0;
     private const int SeekCur = 1;
     private const int SeekEnd = 2;
-    private const ulong DirectMemorySizeBytes = 16384UL * 1024 * 1024;
+    // A PS5 title does not get the console's whole 16 GiB: the system keeps part
+    // of it, and the direct pool a title sees is the remainder minus its flexible
+    // pool. KytyPS5 models the same split (PhysicalMemory::TotalSize() = 13,824
+    // MiB, GetDirectMemorySize() = TotalSize() - flexible). Reporting 16 GiB here
+    // was not merely generous: titles size their own arenas from this number, so
+    // an inflated value makes them ask for arenas the pool can never satisfy.
+    private const ulong TotalPhysicalMemoryBytes = 13824UL * 1024 * 1024;
     private const ulong UnsetMainDirectMemoryPoolBase = ulong.MaxValue;
     private const ulong FlexibleMemorySizeBytes = 448UL * 1024 * 1024;
+    private const ulong DirectMemorySizeBytes = TotalPhysicalMemoryBytes - FlexibleMemorySizeBytes;
     private const int OrbisVirtualQueryInfoSize = 72;
     private const int OrbisKernelMaximumNameLength = 32;
     private const uint MemCommit = 0x1000;
@@ -152,6 +160,10 @@ public static partial class KernelMemoryCompatExports
     }
 
     private static ulong _nextPhysicalAddress;
+    // Highest physical offset the pool has ever handed out. Section pages are
+    // zero the first time they commit, so only a range at or below this mark can
+    // still be carrying a previous owner's bytes and need clearing on reuse.
+    private static ulong _directMemoryEverAllocatedEnd;
     private static ulong _nextVirtualAddress;
     // First guest virtual address handed out for direct/flexible mappings
     // when the game does not request one. 4GB is free on Windows, but on
@@ -1938,7 +1950,11 @@ public static partial class KernelMemoryCompatExports
             }
 
             var fileId = AmprFileRegistry.Register(guestPath, hostPath);
-            LogIoTrace("apr_resolve_ids", guestPath, $"host='{hostPath}' index={i} count={count} id=0x{fileId:X8}");
+            // GT7 passes a fourth argument this export does not model and checks
+            // it after the call, so record it (and the caller) while tracing IO.
+            var extraArg = ctx[CpuRegister.Rcx];
+            TryReadUInt64Compat(ctx, ctx[CpuRegister.Rbp] + 8, out var callerReturn);
+            LogIoTrace("apr_resolve_ids", guestPath, $"host='{hostPath}' index={i} count={count} id=0x{fileId:X8} arg4=0x{extraArg:X16} r8=0x{ctx[CpuRegister.R8]:X16} caller=0x{callerReturn:X16}");
 
             if (!TryWriteUInt32Compat(ctx, idsAddress + (i * sizeof(uint)), fileId))
             {
@@ -2864,7 +2880,16 @@ public static partial class KernelMemoryCompatExports
         var memoryType = unchecked((int)ctx[CpuRegister.R8]);
         var outAddress = ctx[CpuRegister.R9];
 
-        if (length == 0 || outAddress == 0)
+        // Direct memory is handed out in 16 KiB pages, so the kernel rejects a
+        // length or alignment that is not a multiple of one (KytyPS5 models the
+        // same check). Accepting them is not harmlessly lenient: GT7 makes one
+        // call with len=0x180800002 and alignment=0x6007FFE32 (a pointer), which
+        // hardware fails with EINVAL — granting it instead consumed 6 GiB of the
+        // pool and starved the streaming arena that the title allocates next.
+        if (length == 0 ||
+            outAddress == 0 ||
+            !IsAligned(length, OrbisPageSize) ||
+            (alignment != 0 && !IsAligned(alignment, OrbisPageSize)))
         {
             TraceDirectMemoryCall(
                 ctx,
@@ -2925,6 +2950,15 @@ public static partial class KernelMemoryCompatExports
                     memoryType,
                     outAddress,
                     result: OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                if (ShouldTraceDirectMemory())
+                {
+                    // A refused allocation is a branch point for the title, so say
+                    // whether the pool is genuinely full or merely fragmented: a
+                    // first-fit search fails on both, and only the second is ours
+                    // to fix.
+                    Console.Error.WriteLine(DescribeDirectMemoryFreeSpaceLocked(searchStart, searchEnd, length, align));
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
             }
         }
@@ -2967,7 +3001,10 @@ public static partial class KernelMemoryCompatExports
         var alignment = ctx[CpuRegister.Rsi];
         var memoryType = unchecked((int)ctx[CpuRegister.Rdx]);
         var outAddress = ctx[CpuRegister.Rcx];
-        if (outAddress == 0 || length == 0)
+        if (outAddress == 0 ||
+            length == 0 ||
+            !IsAligned(length, OrbisPageSize) ||
+            (alignment != 0 && !IsAligned(alignment, OrbisPageSize)))
         {
             TraceDirectMemoryCall(
                 ctx,
@@ -3069,11 +3106,28 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool released;
+        var detached = new List<(ulong Address, ulong Length)>();
         lock (_memoryGate)
         {
             // The unchecked API ignores an unallocated range, matching the
             // kernel contract used by guest pool allocators during teardown.
-            _ = TryReleaseDirectMemoryRangeLocked(start, length);
+            released = TryReleaseDirectMemoryRangeLocked(start, length);
+            if (released)
+            {
+                detached = DetachReleasedDirectMappingsLocked(ctx, start, length);
+            }
+        }
+
+        RegisterDetachedVirtualRanges(detached);
+
+        if (ShouldTraceDirectMemory())
+        {
+            // Allocations are traced; without the matching releases the pool's
+            // running balance cannot be checked against a title that reuses
+            // physical offsets.
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] release_direct: start=0x{start:X16} len=0x{length:X16} released={released}");
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -3099,15 +3153,93 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        List<(ulong Address, ulong Length)> detached;
         lock (_memoryGate)
         {
+            if (ShouldTraceDirectMemory())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] checked_release_direct: start=0x{start:X16} len=0x{length:X16}");
+            }
+
             if (!TryReleaseDirectMemoryRangeLocked(start, length))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
+
+            detached = DetachReleasedDirectMappingsLocked(ctx, start, length);
         }
 
+        RegisterDetachedVirtualRanges(detached);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Releasing direct memory unmaps it: every mapping of the released physical
+    /// range loses the overlapping part, wherever that mapping started. ShadPS4
+    /// (<c>MemoryManager::Free</c>) and KytyPS5 (<c>ReleaseDirectMemoryInternal</c>)
+    /// both do this, and GT7 relies on it — it releases and re-maps physical ranges
+    /// without ever calling munmap. Left mapped, a stale address would keep
+    /// exposing pages that zero-on-reuse clears for their next owner.
+    /// </summary>
+    private static List<(ulong Address, ulong Length)> DetachReleasedDirectMappingsLocked(
+        CpuContext ctx,
+        ulong start,
+        ulong length)
+    {
+        var detached = new List<(ulong Address, ulong Length)>();
+        if (!TryAddU64(start, length, out var end))
+        {
+            return detached;
+        }
+
+        foreach (var region in _mappedRegions.Values.ToArray())
+        {
+            if (!region.IsDirect ||
+                region.Length == 0 ||
+                !TryAddU64(region.DirectStart, region.Length, out var physicalEnd))
+            {
+                continue;
+            }
+
+            var overlapStart = Math.Max(region.DirectStart, start);
+            var overlapEnd = Math.Min(physicalEnd, end);
+            if (overlapStart >= overlapEnd)
+            {
+                continue;
+            }
+
+            var address = region.Address + (overlapStart - region.DirectStart);
+            var addressEnd = address + (overlapEnd - overlapStart);
+            _mappedRegions.Remove(region.Address);
+            AddMappedRegionSliceLocked(region, region.Address, address, region.Protection);
+            AddMappedRegionSliceLocked(region, addressEnd, region.Address + region.Length, region.Protection);
+            detached.Add((address, addressEnd - address));
+        }
+
+        if (detached.Count != 0 &&
+            KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace))
+        {
+            foreach (var (address, detachedLength) in detached)
+            {
+                addressSpace.TryUnmapShared(address, detachedLength);
+                if (ShouldTraceDirectMemory())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] release_direct_unmap: addr=0x{address:X16} len=0x{detachedLength:X16}");
+                }
+            }
+        }
+
+        return detached;
+    }
+
+    private static void RegisterDetachedVirtualRanges(List<(ulong Address, ulong Length)> detached)
+    {
+        foreach (var (address, length) in detached)
+        {
+            KernelRuntimeCompatExports.RegisterReleasedVirtualRange(address, length);
+        }
     }
 
     [SysAbiExport(
@@ -3178,6 +3310,7 @@ public static partial class KernelMemoryCompatExports
         }
 
         ulong mappedAddress;
+        var shared = false;
         lock (_memoryGate)
         {
             var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
@@ -3193,6 +3326,17 @@ public static partial class KernelMemoryCompatExports
             {
                 mappedAddress = requestedAddress;
                 reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                if (!reserved)
+                {
+                    // A hole left by munmap or a release is a placeholder, which
+                    // the shared path maps straight into. The private claim path
+                    // cannot always take such a hole — one spanning the remnants
+                    // of two earlier mappings fails outright (GT7, race34) — so
+                    // give the direct mapping its real backing first.
+                    shared = TryMapSharedDirectRange(ctx, requestedAddress, length, directMemoryStart, protection);
+                    reserved = shared;
+                }
+
                 if (!reserved)
                 {
                     TryReserveExactGuestVirtualRange(ctx, requestedAddress, length, protection);
@@ -3260,6 +3404,15 @@ public static partial class KernelMemoryCompatExports
             }
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
+
+            // The address is placed; now attach it to the physical range instead
+            // of leaving it on the private pages the reservation just handed out,
+            // so a second mapping of this physical offset is the same memory.
+            if (!shared)
+            {
+                shared = TryMapSharedDirectRange(ctx, mappedAddress, length, directMemoryStart, protection);
+            }
+
             ReplaceMappedRegionRangeLocked(new MappedRegion(
                 mappedAddress,
                 length,
@@ -3272,6 +3425,23 @@ public static partial class KernelMemoryCompatExports
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        // The entry trace records the address *of* the in/out pointer, which is a
+        // caller stack slot and says nothing about where the range landed. Two
+        // guest virtual addresses over one physical range is the alias case, and
+        // it can only be seen from the mapped address, so log it on the way out.
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] map_direct_result: mapped=0x{mappedAddress:X16} len=0x{length:X16} " +
+                $"direct=0x{directMemoryStart:X16} prot=0x{protection:X8}");
+            // A private mapping is not a shared one: aliases of this physical
+            // range will not see each other's writes, so say which one happened
+            // rather than letting the result read as success either way.
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] map_direct_shared: mapped=0x{mappedAddress:X16} len=0x{length:X16} " +
+                $"direct=0x{directMemoryStart:X16} shared={shared}");
         }
 
         GuestWriteWatch.OnDirectMapping(mappedAddress, length, protection);
@@ -3451,6 +3621,12 @@ public static partial class KernelMemoryCompatExports
         var rangeEnd = address + length;
         var physicallyBacked = IsGuestRangeBacked(ctx, address, length);
         var removedAny = false;
+        var wholeCount = 0;
+        // Mappings this call only covers part of. Shared backing has to split a
+        // view and remap the survivors for these, which is the one case that
+        // cannot be done atomically for running guest threads — so trace how
+        // often a title actually does it.
+        var partialRegions = Array.Empty<(ulong Address, ulong Length)>();
         lock (_memoryGate)
         {
             var removedRegions = _mappedRegions.Values
@@ -3459,9 +3635,23 @@ public static partial class KernelMemoryCompatExports
                     region.Address < rangeEnd &&
                     region.Length <= rangeEnd - region.Address)
                 .ToArray();
+            wholeCount = removedRegions.Length;
+
+            if (ShouldTraceDirectMemory())
+            {
+                partialRegions = _mappedRegions.Values
+                    .Where(region =>
+                        TryAddU64(region.Address, region.Length, out var regionEnd) &&
+                        region.Address < rangeEnd &&
+                        regionEnd > address &&
+                        !(region.Address >= address && region.Length <= rangeEnd - region.Address))
+                    .Select(region => (region.Address, region.Length))
+                    .ToArray();
+            }
 
             if (removedRegions.Length == 0 && !physicallyBacked)
             {
+                TraceMunmap(address, length, rangeEnd, wholeCount, partialRegions, physicallyBacked, "NOT_FOUND");
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
@@ -3475,6 +3665,15 @@ public static partial class KernelMemoryCompatExports
                         : _allocatedFlexibleBytes - mappedRegion.Length;
                 }
             }
+
+            // Detach the host views last: the bookkeeping above covers whole
+            // mappings only, while this also cuts the boundary views a partial
+            // unmap crosses, remapping their survivors at the physical offsets
+            // they already had.
+            if (KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace))
+            {
+                addressSpace.TryUnmapShared(address, length);
+            }
         }
 
         if (physicallyBacked || removedAny)
@@ -3482,7 +3681,37 @@ public static partial class KernelMemoryCompatExports
             KernelRuntimeCompatExports.RegisterReleasedVirtualRange(address, length);
         }
 
+        TraceMunmap(address, length, rangeEnd, wholeCount, partialRegions, physicallyBacked, "OK");
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static void TraceMunmap(
+        ulong address,
+        ulong length,
+        ulong rangeEnd,
+        int wholeCount,
+        (ulong Address, ulong Length)[] partialRegions,
+        bool physicallyBacked,
+        string result)
+    {
+        if (!ShouldTraceDirectMemory())
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] munmap: addr=0x{address:X16} len=0x{length:X16} whole={wholeCount} " +
+            $"partial={partialRegions.Length} backed={physicallyBacked} result={result}");
+        foreach (var (regionAddress, regionLength) in partialRegions)
+        {
+            // head/tail are the bytes of the mapping this call leaves behind:
+            // exactly the pieces a shared-backing implementation must remap.
+            var head = address > regionAddress ? address - regionAddress : 0;
+            var tail = regionAddress + regionLength > rangeEnd ? regionAddress + regionLength - rangeEnd : 0;
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] munmap_partial: region=0x{regionAddress:X16}+0x{regionLength:X16} " +
+                $"head=0x{head:X16} tail=0x{tail:X16}");
+        }
     }
 
     [SysAbiExport(
@@ -3570,8 +3799,38 @@ public static partial class KernelMemoryCompatExports
         var memoryType = 0;
         lock (_memoryGate)
         {
-            if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region))
+            if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region) &&
+                !TryDescribeHostMappingForVirtualQuery(queryAddress, out region))
             {
+                if (ShouldTraceDirectMemory())
+                {
+                    // Callers branch on this: a title that asks whether a buffer is
+                    // direct memory takes its failure path when the answer is
+                    // NOT_FOUND, so an address missing from the table is worth
+                    // naming alongside the next region that does exist.
+                    var nextKnown = TryFindVirtualQueryRegionLocked(queryAddress, findNext: true, out var following)
+                        ? $"0x{following.Address:X16}+0x{following.Length:X16} direct={following.IsDirect}"
+                        : "none";
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] virtual_query_miss: addr=0x{queryAddress:X16} " +
+                        $"flags=0x{flags:X8} regions={_mappedRegions.Count} next={nextKnown}");
+
+                    // The caller's frames carry the object that supplied this
+                    // address; without them a miss says only that the address is
+                    // unknown, not where a title got it.
+                    var stackPointer = ctx[CpuRegister.Rsp];
+                    for (var slot = 0; slot < 24; slot++)
+                    {
+                        if (!ctx.TryReadUInt64(stackPointer + (ulong)(slot * 8), out var word) || word == 0)
+                        {
+                            continue;
+                        }
+
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] virtual_query_miss_stack: +0x{slot * 8:X3} = 0x{word:X16}");
+                    }
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
@@ -3599,6 +3858,20 @@ public static partial class KernelMemoryCompatExports
         }
 
         stateFlags |= 0x10u;
+
+        // A title that asks "is this buffer GPU-visible direct memory?" branches
+        // on the direct bit and the GPU protection bits together; answering OK
+        // without them is as fatal as NOT_FOUND, and silent. GT7 drops a
+        // streaming submission larger than 4 KB on exactly this test and never
+        // signals the event its reader waits on.
+        if (ShouldTraceDirectMemory() &&
+            ((stateFlags & 0x02u) == 0 || (region.Protection & 0xC0) == 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] virtual_query_nondirect: addr=0x{queryAddress:X16} " +
+                $"region=0x{region.Address:X16}+0x{region.Length:X16} state=0x{stateFlags:X2} " +
+                $"prot=0x{region.Protection:X8} direct={region.IsDirect} flexible={region.IsFlexible}");
+        }
 
         BinaryPrimitives.WriteUInt64LittleEndian(payload[0..8], region.Address);
         BinaryPrimitives.WriteUInt64LittleEndian(payload[8..16], regionEnd);
@@ -6375,6 +6648,43 @@ public static partial class KernelMemoryCompatExports
                 : HostPageNoAccess;
     }
 
+    /// <summary>
+    /// Describes a mapping this HLE did not create. Guest thread stacks and
+    /// callback stacks are mapped by the CPU backend, so a title asking about a
+    /// stack buffer finds nothing in the tracked table; guest addresses are
+    /// host-identical, so the host mapping answers accurately. GT7's asset
+    /// reader queries its streaming buffer before every file open and abandons
+    /// the open when the query fails.
+    /// </summary>
+    private static bool TryDescribeHostMappingForVirtualQuery(ulong queryAddress, out MappedRegion region)
+    {
+        region = default;
+        if (!HostPlatform.Current.Memory.Query(queryAddress, out var hostRegion) ||
+            hostRegion.State != HostRegionState.Committed ||
+            hostRegion.RegionSize == 0)
+        {
+            return false;
+        }
+
+        var protection = hostRegion.Protection switch
+        {
+            HostPageProtection.ReadOnly => OrbisProtCpuRead,
+            HostPageProtection.ReadWrite => OrbisProtCpuReadWrite,
+            HostPageProtection.Execute => OrbisProtCpuExec,
+            HostPageProtection.ReadExecute => OrbisProtCpuRead | OrbisProtCpuExec,
+            HostPageProtection.ReadWriteExecute => OrbisProtCpuReadWrite | OrbisProtCpuExec,
+            _ => 0,
+        };
+        region = new MappedRegion(
+            hostRegion.BaseAddress,
+            hostRegion.RegionSize,
+            protection,
+            IsFlexible: true,
+            IsDirect: false,
+            DirectStart: 0);
+        return true;
+    }
+
     private static bool TryFindVirtualQueryRegionLocked(ulong queryAddress, bool findNext, out MappedRegion region)
     {
         region = default;
@@ -6507,6 +6817,59 @@ public static partial class KernelMemoryCompatExports
     private static bool IsAligned(ulong value, ulong alignment) =>
         alignment != 0 && value % alignment == 0;
 
+    private static string DescribeDirectMemoryFreeSpaceLocked(
+        ulong searchStart,
+        ulong searchEnd,
+        ulong length,
+        ulong alignment)
+    {
+        var effectiveEnd = Math.Min(searchEnd == 0 ? DirectMemorySizeBytes : searchEnd, DirectMemorySizeBytes);
+        var allocations = new List<DirectAllocation>(_directAllocations.Values);
+        allocations.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+
+        ulong used = 0;
+        ulong free = 0;
+        ulong largestGap = 0;
+        ulong largestGapStart = 0;
+        var cursor = searchStart;
+        foreach (var allocation in allocations)
+        {
+            used += allocation.Length;
+            if (allocation.Start >= cursor)
+            {
+                var gap = Math.Min(allocation.Start, effectiveEnd) - Math.Min(cursor, effectiveEnd);
+                free += gap;
+                if (gap > largestGap)
+                {
+                    largestGap = gap;
+                    largestGapStart = cursor;
+                }
+            }
+
+            var end = allocation.Start + allocation.Length;
+            if (end > cursor)
+            {
+                cursor = end;
+            }
+        }
+
+        if (cursor < effectiveEnd)
+        {
+            var tail = effectiveEnd - cursor;
+            free += tail;
+            if (tail > largestGap)
+            {
+                largestGap = tail;
+                largestGapStart = cursor;
+            }
+        }
+
+        return $"[LOADER][TRACE] direct_memory_exhausted: want=0x{length:X} align=0x{alignment:X} " +
+            $"search=[0x{searchStart:X},0x{effectiveEnd:X}) allocations={allocations.Count} " +
+            $"used=0x{used:X} free=0x{free:X} largest_gap=0x{largestGap:X} at=0x{largestGapStart:X} " +
+            $"pool=0x{DirectMemorySizeBytes:X}";
+    }
+
     private static bool TryAllocateDirectMemoryLocked(
         ulong searchStart,
         ulong searchEnd,
@@ -6531,8 +6894,57 @@ public static partial class KernelMemoryCompatExports
 
         _directAllocations[freePosition] = new DirectAllocation(freePosition, length, memoryType);
         _nextPhysicalAddress = endAddress;
+        ClearRecycledDirectMemoryLocked(freePosition, length);
         selectedAddress = freePosition;
         return true;
+    }
+
+    /// <summary>
+    /// Clears the part of a freshly allocated physical range that a previous
+    /// allocation may have written. Released section pages keep their bytes and
+    /// cannot be decommitted, so this is where a recycled range is made zero —
+    /// not at release, where an alias the guest still holds may be mapped over it.
+    /// </summary>
+    private static void ClearRecycledDirectMemoryLocked(ulong start, ulong length)
+    {
+        if (!TryAddU64(start, length, out var end))
+        {
+            return;
+        }
+
+        if (start < _directMemoryEverAllocatedEnd)
+        {
+            GuestSharedBacking.ConfigurePoolSize(DirectMemorySizeBytes);
+            GuestSharedBacking.ZeroPhysicalRange(start, Math.Min(end, _directMemoryEverAllocatedEnd) - start);
+        }
+
+        if (end > _directMemoryEverAllocatedEnd)
+        {
+            _directMemoryEverAllocatedEnd = end;
+        }
+    }
+
+    /// <summary>
+    /// Attaches a mapped guest range to its physical offset so aliases of that
+    /// offset are the same pages. Returns false when the host cannot do it, and
+    /// the caller keeps the private backing it already placed.
+    /// </summary>
+    private static bool TryMapSharedDirectRange(
+        CpuContext ctx,
+        ulong address,
+        ulong length,
+        ulong physicalOffset,
+        int protection)
+    {
+        if (!GuestSharedBacking.IsSupported ||
+            !KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace))
+        {
+            return false;
+        }
+
+        GuestSharedBacking.ConfigurePoolSize(DirectMemorySizeBytes);
+        return addressSpace.TryMapSharedDirect(
+            address, length, physicalOffset, (protection & OrbisProtCpuExec) != 0);
     }
 
     private static bool TryFindAllocatableDirectMemoryRangeLocked(

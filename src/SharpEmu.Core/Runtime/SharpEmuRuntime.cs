@@ -140,6 +140,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         LastBasicBlockTrace = null;
         LastMilestoneLog = null;
         FiberExports.ResetRuntimeState();
+        SharpEmu.Libs.Ime.ImeExports.ResetRuntimeState();
         KernelModuleRegistry.Reset();
         var image = LoadImage(normalizedEbootPath);
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);

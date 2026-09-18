@@ -12,13 +12,25 @@ namespace SharpEmu.Libs.Tests.Ampr;
 public class AmprFileRegistryTests
 {
     [Fact]
-    public void ComputeFileId_matches_utf8_fnv1a()
+    public void ComputeFileId_matches_utf8_fnv1a_without_the_sign_bit()
     {
         const string relative = "CoreData/foo/bar.bin";
-        Assert.Equal(FnvUtf8("$/" + relative), AmprFileRegistry.ComputeFileId("$/" + relative));
-        Assert.Equal(FnvUtf8("/app0/" + relative), AmprFileRegistry.ComputeFileId("/app0/" + relative));
-        Assert.Equal(FnvUtf8("app0/" + relative), AmprFileRegistry.ComputeFileId("app0/" + relative));
-        Assert.Equal(FnvUtf8(relative), AmprFileRegistry.ComputeFileId(relative));
+        Assert.Equal(FnvUtf8("$/" + relative) & 0x7FFFFFFFu, AmprFileRegistry.ComputeFileId("$/" + relative));
+        Assert.Equal(FnvUtf8("/app0/" + relative) & 0x7FFFFFFFu, AmprFileRegistry.ComputeFileId("/app0/" + relative));
+        Assert.Equal(FnvUtf8("app0/" + relative) & 0x7FFFFFFFu, AmprFileRegistry.ComputeFileId("app0/" + relative));
+        Assert.Equal(FnvUtf8(relative) & 0x7FFFFFFFu, AmprFileRegistry.ComputeFileId(relative));
+    }
+
+    // GT7 keeps APR handles in signed 32-bit slots: an id with bit 31 set comes
+    // back as a negative handle and the title abandons the file unread.
+    [Fact]
+    public void ComputeFileId_never_sets_the_sign_bit()
+    {
+        for (var i = 0; i < 5000; i++)
+        {
+            var id = AmprFileRegistry.ComputeFileId($"$/contents/{i}/asset_{i}.bin");
+            Assert.True(id < 0x80000000u, $"id 0x{id:X8} has bit 31 set");
+        }
     }
 
     [Fact]

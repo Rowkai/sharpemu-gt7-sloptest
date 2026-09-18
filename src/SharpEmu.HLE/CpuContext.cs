@@ -14,6 +14,8 @@ public sealed class CpuContext(ICpuMemory memory, Generation generation)
     private readonly ulong[] _ymmUpperRegisters = new ulong[32];
     private bool _raxWritten;
 
+    private bool _returnPairWritten;
+
     public ICpuMemory Memory { get; } = memory ?? throw new ArgumentNullException(nameof(memory));
 
     public Generation TargetGeneration { get; } = generation;
@@ -54,12 +56,38 @@ public sealed class CpuContext(ICpuMemory memory, Generation generation)
         }
     }
 
+    /// <summary>
+    /// Resets both return-register write flags. Call this before dispatching a
+    /// handler: the flags are per-call, and the context outlives the call.
+    /// </summary>
     public void ClearRaxWriteFlag()
     {
         _raxWritten = false;
+        _returnPairWritten = false;
     }
 
     public bool WasRaxWritten => _raxWritten;
+
+    /// <summary>
+    /// True when the handler returned a 16-byte aggregate through
+    /// <see cref="SetReturnPair"/> and RDX carries its second eightbyte.
+    /// </summary>
+    public bool WasReturnPairWritten => _returnPairWritten;
+
+    /// <summary>
+    /// Returns a 16-byte aggregate of two integer eightbytes. SysV passes the
+    /// first back in RAX and the second in RDX, so a handler cannot express one
+    /// through its int result. The import trampoline restores the guest's own
+    /// RDX from the argument pack on the way out, which is why the second
+    /// eightbyte needs the flag: the gateway forwards it only when asked.
+    /// </summary>
+    public int SetReturnPair(ulong first, ulong second)
+    {
+        this[CpuRegister.Rax] = first;
+        this[CpuRegister.Rdx] = second;
+        _returnPairWritten = true;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     public void GetXmmRegister(int registerIndex, out ulong low, out ulong high)
     {

@@ -421,6 +421,135 @@ public sealed partial class DirectExecutionBackend
 			: 0;
 	}
 
+	/// <summary>
+	/// Renders the <c>SHARPEMU_DUMP_GUEST_MEMORY</c> specs at a stall snapshot.
+	/// A spec is an absolute hex address or a register-relative expression such as
+	/// <c>rbx-0x28</c>; guest heap objects land at a different address on every
+	/// boot, so the only address that is knowable in advance is one derived from
+	/// the snapshot's own registers. An optional <c>:length</c> suffix dumps more
+	/// than the default 0x40 bytes (capped at 0x400), which is what a vtable needs.
+	/// Specs are comma-separated.
+	/// </summary>
+	private static void DumpGuestMemorySpecs(CpuContext cpuContext, string? specs)
+	{
+		if (string.IsNullOrWhiteSpace(specs))
+		{
+			return;
+		}
+
+		foreach (var spec in specs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+		{
+			var body = spec;
+			var length = 0x40;
+			var colon = body.IndexOf(':');
+			if (colon >= 0)
+			{
+				length = (int)Math.Clamp(ParseOptionalHexAddress(body[(colon + 1)..]), 0x10, 0x400);
+				body = body[..colon];
+			}
+
+			if (!TryResolveDumpAddress(cpuContext, body, out var address))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] memdump {spec}: unparsed");
+				continue;
+			}
+
+			var dump = new byte[length];
+			if (!cpuContext.Memory.TryRead(address, dump))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] memdump 0x{address:X16} ({spec}): unreadable");
+				continue;
+			}
+
+			for (var row = 0; (row * 16) + 16 <= length; row++)
+			{
+				var low = BitConverter.ToUInt64(dump, row * 16);
+				var high = BitConverter.ToUInt64(dump, (row * 16) + 8);
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] memdump 0x{address + (ulong)(row * 16):X16}: {low:X16} {high:X16}");
+			}
+		}
+	}
+
+	internal static bool TryResolveDumpAddress(CpuContext? cpuContext, string spec, out ulong address)
+	{
+		address = 0;
+		var text = spec.Trim();
+		if (text.Length == 0)
+		{
+			return false;
+		}
+
+		// "[<spec>]±<hex>" follows the pointer stored at <spec>. An object graph is
+		// usually two or three hops from the one address known ahead of the run, and
+		// a snapshot that has to stop at every hop costs a boot each.
+		if (text[0] == '[')
+		{
+			var close = text.LastIndexOf(']');
+			if (close < 0 || cpuContext is null)
+			{
+				return false;
+			}
+
+			if (!TryResolveDumpAddress(cpuContext, text[1..close], out var pointerAt))
+			{
+				return false;
+			}
+
+			Span<byte> pointer = stackalloc byte[8];
+			if (!cpuContext.Memory.TryRead(pointerAt, pointer))
+			{
+				return false;
+			}
+
+			address = BitConverter.ToUInt64(pointer);
+			var rest = text[(close + 1)..];
+			if (rest.Length == 0)
+			{
+				return true;
+			}
+
+			if (rest[0] != '+' && rest[0] != '-')
+			{
+				return false;
+			}
+
+			var delta = ParseOptionalHexAddress(rest[1..]);
+			address = rest[0] == '-' ? address - delta : address + delta;
+			return true;
+		}
+
+		var split = text.IndexOfAny(new[] { '+', '-' });
+		var head = split < 0 ? text : text[..split];
+		if (head.Length > 0 && char.IsLetter(head[0]) &&
+			Enum.TryParse<CpuRegister>(head, ignoreCase: true, out var register))
+		{
+			if (cpuContext is null)
+			{
+				return false;
+			}
+
+			address = cpuContext[register];
+		}
+		else
+		{
+			address = ParseOptionalHexAddress(head);
+			if (address == 0)
+			{
+				return false;
+			}
+		}
+
+		if (split < 0)
+		{
+			return true;
+		}
+
+		var offset = ParseOptionalHexAddress(text[(split + 1)..]);
+		address = text[split] == '-' ? address - offset : address + offset;
+		return true;
+	}
+
 	private static bool IsPlausibleReturnAddress(ulong address)
 	{
 		return address >= 12884901888L && address < 17592186044416L && !IsUnresolvedSentinel(address);

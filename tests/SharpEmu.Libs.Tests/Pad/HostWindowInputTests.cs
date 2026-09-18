@@ -7,6 +7,16 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.Pad;
 
+// HostWindowInput and HostWindowInputSource are process-global. Classes that
+// Connect/Disconnect them must not run in parallel, or one clears the source
+// another test just published.
+[CollectionDefinition(HostWindowInputStateCollection.Name, DisableParallelization = true)]
+public sealed class HostWindowInputStateCollection
+{
+    public const string Name = "HostWindowInputState";
+}
+
+[Collection(HostWindowInputStateCollection.Name)]
 public sealed class HostWindowInputTests
 {
     [Theory]

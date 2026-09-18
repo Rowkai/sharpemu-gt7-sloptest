@@ -29,4 +29,19 @@ public interface IGuestAddressSpace : IGuestMemoryAllocator
     bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress);
 
     bool TryProtect(ulong address, ulong size, GuestPageProtection protection);
+
+    /// <summary>
+    /// Attaches a guest range to a physical offset of the direct-memory pool so
+    /// every mapping of that physical range is the same pages, which is what a
+    /// direct mapping is on hardware. Returns false when the host cannot back the
+    /// range that way, leaving whatever backing the caller already had — a caller
+    /// must never report that as a shared mapping.
+    /// </summary>
+    bool TryMapSharedDirect(ulong address, ulong size, ulong physicalOffset, bool executable) => false;
+
+    /// <summary>
+    /// Removes a shared attachment, keeping the addresses reserved for the guest.
+    /// Returns false when the range holds no shared mapping.
+    /// </summary>
+    bool TryUnmapShared(ulong address, ulong size) => false;
 }

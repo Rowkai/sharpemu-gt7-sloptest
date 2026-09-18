@@ -31,11 +31,13 @@ internal enum MtlPixelFormat : uint
     R32Sint = 54,
     R32Float = 55,
     Rg16Unorm = 60,
+    Rg16Snorm = 62,
     Rg16Uint = 63,
     Rg16Sint = 64,
     Rg16Float = 65,
     Rgba8Unorm = 70,
     Rgba8UnormSrgb = 71,
+    Rgba8Snorm = 72,
     Rgba8Uint = 73,
     Rgba8Sint = 74,
     Bgra8Unorm = 80,
@@ -48,6 +50,7 @@ internal enum MtlPixelFormat : uint
     Rg32Sint = 104,
     Rg32Float = 105,
     Rgba16Unorm = 110,
+    Rgba16Snorm = 112,
     Rgba16Uint = 113,
     Rgba16Sint = 114,
     Rgba16Float = 115,
@@ -134,11 +137,13 @@ internal static class MetalGuestFormats
             (4, 5) => MtlPixelFormat.R32Sint,
             (4, 7) => MtlPixelFormat.R32Float,
             (5, 0) => MtlPixelFormat.Rg16Unorm,
+            (5, 1) => MtlPixelFormat.Rg16Snorm,
             (5, 4) => MtlPixelFormat.Rg16Uint,
             (5, 5) => MtlPixelFormat.Rg16Sint,
             (5, 7) => MtlPixelFormat.Rg16Float,
             (6, 7) or (7, 7) => MtlPixelFormat.Rg11B10Float,
             (8, _) or (9, _) => MtlPixelFormat.Bgr10A2Unorm,
+            (10, 1) => MtlPixelFormat.Rgba8Snorm,
             (10, 4) => MtlPixelFormat.Rgba8Uint,
             (10, 5) => MtlPixelFormat.Rgba8Sint,
             (10, 9) => MtlPixelFormat.Rgba8UnormSrgb,
@@ -146,6 +151,7 @@ internal static class MetalGuestFormats
             (11, 5) => MtlPixelFormat.Rg32Sint,
             (11, 7) => MtlPixelFormat.Rg32Float,
             (12, 0) => MtlPixelFormat.Rgba16Unorm,
+            (12, 1) => MtlPixelFormat.Rgba16Snorm,
             (12, 4) => MtlPixelFormat.Rgba16Uint,
             (12, 5) => MtlPixelFormat.Rgba16Sint,
             (12, 7) => MtlPixelFormat.Rgba16Float,
@@ -194,6 +200,7 @@ internal static class MetalGuestFormats
                 MtlPixelFormat.Rg8Sint or MtlPixelFormat.B5G6R5Unorm => 2u,
             MtlPixelFormat.Rg32Uint or MtlPixelFormat.Rg32Sint or
                 MtlPixelFormat.Rg32Float or MtlPixelFormat.Rgba16Unorm or
+                MtlPixelFormat.Rgba16Snorm or
                 MtlPixelFormat.Rgba16Uint or MtlPixelFormat.Rgba16Sint or
                 MtlPixelFormat.Rgba16Float => 8u,
             MtlPixelFormat.Rgba32Uint or MtlPixelFormat.Rgba32Sint or

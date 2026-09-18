@@ -42,6 +42,17 @@ public static class VideoOutExports
     private const int VideoOutVblankStatusSize = 0x28;
     private const ulong SceVideoOutOutputModeDefault = 1;
     private const ulong SceVideoOutOutputMode119_88Hz = 0xF;
+    // SCE_VIDEO_OUT_REFRESH_RATE_*. These are enum ordinals, not hertz: the
+    // output status reports the mode a display is actually driven at, and the
+    // HDMI modes are the NTSC-derived fractional ones, so a 60 Hz panel reports
+    // 59.94 Hz. Titles branch on these ordinals directly.
+    private const ulong SceVideoOutRefreshRateUnknown = 0;
+    private const ulong SceVideoOutRefreshRate23_98Hz = 1;
+    private const ulong SceVideoOutRefreshRate50Hz = 2;
+    private const ulong SceVideoOutRefreshRate59_94Hz = 3;
+    private const ulong SceVideoOutRefreshRate29_97Hz = 6;
+    private const ulong SceVideoOutRefreshRate119_88Hz = 13;
+    private const ulong SceVideoOutRefreshRate89_91Hz = 35;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong SceVideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
     private const ulong SceVideoOutPixelFormatA2R10G10B10 = 0x88060000;
@@ -58,11 +69,14 @@ public static class VideoOutExports
     private const ulong SceVideoOutPixelFormat2B10G10R10A2Srgb = 0x8100000000000000;
     private const ulong SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq = 0x8100070422000000;
     private const ulong SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq = 0x8100070400000000;
+    // Raw kevent idents, as the real libSceVideoOut reports them. They are not
+    // free-form: a title may read the ident straight off the kevent instead of
+    // translating through sceVideoOutGetEventId, so they must match hardware.
+    // Flip 0x6 / vblank 0x7 are the console values; vblank was previously 0x40,
+    // which only worked for titles that translate. sceVideoOutGetEventId maps
+    // these to the public ids (0 = flip, 1 = vblank) below.
     private const ulong SceVideoOutInternalEventFlip = 0x6;
-    // Distinct internal ident for vblank events. Games interpret events through
-    // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
-    // its distinctness from the flip ident matters for GetEventId/GetEventData.
-    private const ulong SceVideoOutInternalEventVblank = 0x40;
+    private const ulong SceVideoOutInternalEventVblank = 0x7;
     private const short OrbisKernelEventFilterVideoOut = -13;
 
     private static readonly object _stateGate = new();
@@ -204,8 +218,15 @@ public static class VideoOutExports
         public required int Handle { get; init; }
         public int FlipRate { get; set; }
         public ulong VblankCount { get; set; }
+        // Completed flips, not submitted ones: sceVideoOutGetFlipStatus reports
+        // retirement, and a title that recycles a display buffer once the count
+        // catches up with its own submit counter reuses it a frame early if this
+        // moves at submit time.
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
+        public long LastFlipArg { get; set; } = -1;
+        public int PendingFlips { get; set; }
+        public int PendingGpuFlips { get; set; }
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
@@ -433,10 +454,35 @@ public static class VideoOutExports
         var resolutionClass = port.OutputWidth >= 3840 || port.OutputHeight >= 2160 ? 2 : 1;
         BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
         BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], 1);
-        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], port.RefreshRate);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..0x10], ToSceRefreshRate(port.RefreshRate));
         return ctx.Memory.TryWrite(statusAddress, status)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    /// <summary>
+    /// Maps a refresh rate in hertz to the <c>SCE_VIDEO_OUT_REFRESH_RATE_*</c>
+    /// ordinal the output status reports. A host mode the console has no ordinal
+    /// for (144 Hz, say) is reported as unknown, which is what hardware does for
+    /// a mode it is not driving.
+    /// </summary>
+    /// <remarks>
+    /// The bands are deliberately loose. Host display enumeration rounds — a
+    /// 59.94 Hz mode is reported as 59 or 60 depending on the driver — so an
+    /// exact match would report "unknown" for the commonest display there is.
+    /// </remarks>
+    internal static ulong ToSceRefreshRate(uint hertz)
+    {
+        return hertz switch
+        {
+            >= 118 and <= 121 => SceVideoOutRefreshRate119_88Hz,
+            >= 88 and <= 91 => SceVideoOutRefreshRate89_91Hz,
+            >= 59 and <= 61 => SceVideoOutRefreshRate59_94Hz,
+            >= 49 and <= 51 => SceVideoOutRefreshRate50Hz,
+            >= 29 and <= 31 => SceVideoOutRefreshRate29_97Hz,
+            >= 23 and <= 25 => SceVideoOutRefreshRate23_98Hz,
+            _ => SceVideoOutRefreshRateUnknown,
+        };
     }
 
     [SysAbiExport(
@@ -717,26 +763,46 @@ public static class VideoOutExports
         }
 
         ulong count;
-        uint currentBuffer;
+        int currentBuffer;
+        long flipArg;
+        int gcQueueNum;
+        int flipPendingNum;
         lock (_stateGate)
         {
             count = port.FlipCount;
-            currentBuffer = unchecked((uint)port.CurrentBuffer);
+            currentBuffer = port.CurrentBuffer;
+            flipArg = port.LastFlipArg;
+            gcQueueNum = port.PendingGpuFlips;
+            flipPendingNum = port.PendingFlips;
         }
 
+        // PS5 SceVideoOutFlipStatus. The field offsets are not the PS4 ones:
+        // currentBuffer lives at +0x38 and +0x20 is reserved, so writing the
+        // buffer index at +0x20 both lies about a reserved field and leaves
+        // +0x38 holding whatever the caller had on the stack.
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0); // processTime
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0); // reserved0
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, unchecked((ulong)flipArg));
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, 0); // reserved1
         // Ghost of Yotei polls a flag past the classic 0x28-byte struct and
-        // spins on sceKernelUsleep(1) while it's nonzero; the caller never
+        // spins on sceKernelUsleep(1) while it is nonzero; the caller never
         // pre-zeroes that stack buffer, so an untouched field reads back as
-        // garbage. Flips complete synchronously in this emulator (see
-        // SubmitFlip/sceVideoOutIsFlipPending, always not-pending), so the
-        // extended region must read zero here too.
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x28, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x30, 0);
+        // garbage. Every documented field through +0x40 is written for that
+        // reason. reserved3 past it is left alone: a title that passed a
+        // shorter buffer would have its stack overwritten.
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x28, 0); // processTimeCounter
+        // gcQueueNum/flipPendingNum and currentBuffer/reserved2 are int32 pairs;
+        // each pair is written as the qword it shares.
+        KernelMemoryCompatExports.TryWriteUInt64Compat(
+            ctx,
+            statusAddress + 0x30,
+            unchecked((uint)gcQueueNum) | ((ulong)unchecked((uint)flipPendingNum) << 32));
+        KernelMemoryCompatExports.TryWriteUInt64Compat(
+            ctx,
+            statusAddress + 0x38,
+            unchecked((uint)currentBuffer));
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x40, 0); // submitProcessTimeCounter
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -748,13 +814,22 @@ public static class VideoOutExports
     public static int VideoOutIsFlipPending(CpuContext ctx)
     {
         var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        if (!TryGetPort(handle, out _))
+        if (!TryGetPort(handle, out var port))
         {
             return OrbisVideoOutErrorInvalidHandle;
         }
 
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        int pending;
+        lock (_stateGate)
+        {
+            pending = port.PendingFlips;
+        }
+
+        // Hardware answers with the number of flips submitted and not yet
+        // retired. Answering zero unconditionally tells a title its display
+        // buffers are free the instant it submits them.
+        ctx[CpuRegister.Rax] = unchecked((ulong)(long)pending);
+        return pending;
     }
 
     [SysAbiExport(
@@ -1182,8 +1257,14 @@ public static class VideoOutExports
                 return OrbisVideoOutErrorInvalidIndex;
             }
 
-            port.CurrentBuffer = bufferIndex;
-            port.FlipCount++;
+            port.PendingFlips++;
+            if (!submitGpuImage)
+            {
+                // AGC SetFlip packets are the GPU-queued kind hardware counts in
+                // gcQueueNum; sceVideoOutSubmitFlip calls are not.
+                port.PendingGpuFlips++;
+            }
+
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEventCount = port.FlipEvents.Count;
@@ -1221,6 +1302,23 @@ public static class VideoOutExports
             _ = TryDumpFrame(ctx, port, bufferIndex, flipMode, flipArg);
         }
 
+        void CompleteFlip()
+        {
+            lock (_stateGate)
+            {
+                port.FlipCount++;
+                port.CurrentBuffer = bufferIndex;
+                port.LastFlipArg = flipArg;
+                port.PendingFlips = Math.Max(0, port.PendingFlips - 1);
+                if (!submitGpuImage)
+                {
+                    port.PendingGpuFlips = Math.Max(0, port.PendingGpuFlips - 1);
+                }
+            }
+
+            TriggerFlipEvents();
+        }
+
         void TriggerFlipEvents()
         {
             if (flipEvents is null)
@@ -1249,14 +1347,14 @@ public static class VideoOutExports
 
         if (submitGpuImage)
         {
-            TriggerFlipEvents();
+            CompleteFlip();
         }
         else if (GuestGpu.Current.SubmitOrderedGuestAction(
-                     TriggerFlipEvents,
+                     CompleteFlip,
                      $"videoout flip complete handle={handle} index={bufferIndex}") == 0)
         {
             // Headless startup has no render queue to order against.
-            TriggerFlipEvents();
+            CompleteFlip();
         }
 
         TraceVideoOut(

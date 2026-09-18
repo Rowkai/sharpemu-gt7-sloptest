@@ -142,19 +142,37 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         public static readonly CrossPlatformHostMemory Instance = new();
 
-        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection) =>
-            unchecked((ulong)HostMemory.Alloc(
+        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            // Inside the launcher's reservation the address is a placeholder,
+            // which plain VirtualAlloc cannot allocate into.
+            if (HLE.Host.GuestPlaceholder.TryClaim(
+                    desiredAddress, size, ToRawProtection(protection), commit: true, out var claimed))
+            {
+                return claimed;
+            }
+
+            return unchecked((ulong)HostMemory.Alloc(
                 (void*)desiredAddress,
                 (nuint)size,
                 HostMemory.MEM_RESERVE | HostMemory.MEM_COMMIT,
                 ToRawProtection(protection)));
+        }
 
-        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection) =>
-            unchecked((ulong)HostMemory.Alloc(
+        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            if (HLE.Host.GuestPlaceholder.TryClaim(
+                    desiredAddress, size, ToRawProtection(protection), commit: false, out var claimed))
+            {
+                return claimed;
+            }
+
+            return unchecked((ulong)HostMemory.Alloc(
                 (void*)desiredAddress,
                 (nuint)size,
                 HostMemory.MEM_RESERVE,
                 ToRawProtection(protection)));
+        }
 
         public bool Commit(ulong address, ulong size, HostPageProtection protection) =>
             HostMemory.Alloc(
@@ -164,6 +182,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 ToRawProtection(protection)) != null;
 
         public bool Free(ulong address) =>
+            // Inside a guest window the address belongs to the reservation, so
+            // hand it back as a placeholder rather than letting it go free.
+            HLE.Host.GuestPlaceholder.TryRestore(address) ||
             HostMemory.Free((void*)address, 0, HostMemory.MEM_RELEASE);
 
         public bool Protect(
@@ -461,6 +482,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return $"fail:{primeBytes:X}";
     }
 
+    /// <summary>
+    /// True for a piece of the launcher's guest-window reservation: reserved,
+    /// created PAGE_NOACCESS, and inside a window the guest owns. Those are
+    /// placeholders, so they can be claimed rather than treated as foreign.
+    /// </summary>
+    private static bool IsGuestWindowPlaceholder(HostRegionInfo info) =>
+        info.State == HostRegionState.Reserved &&
+        info.RawState == 0x2000 &&
+        HLE.Host.GuestAddressWindows.Contains(info.BaseAddress, info.RegionSize);
+
     private ulong TryAllocateFixedThroughGranules(
         ulong desiredAddress,
         ulong alignedSize,
@@ -556,6 +587,35 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 {
                     var trusted = _fixedGranuleReservationBases.Contains(info.AllocationBase) ||
                         IsTrackedRegionBase(info.AllocationBase);
+                    if (!trusted && IsGuestWindowPlaceholder(info))
+                    {
+                        // The launcher reserved the guest window as placeholders so
+                        // no host allocation could take an address the guest may
+                        // ask for. Claiming a piece replaces the placeholder in one
+                        // step, which is what keeps that address ours throughout.
+                        var claimed = _hostMemory.Reserve(cursor, segmentEnd - cursor, HostPageProtection.ReadWrite);
+                        if (claimed != cursor)
+                        {
+                            if (claimed != 0)
+                            {
+                                _hostMemory.Free(claimed);
+                            }
+
+                            // Always report this one: a failed claim means the
+                            // guest cannot have an address the launcher promised
+                            // it, and silence here cost a debugging session.
+                            Log.Warn(
+                                $"placeholder-claim failed: want=0x{cursor:X16}+0x{segmentEnd - cursor:X} " +
+                                $"placeholder=0x{info.BaseAddress:X16}+0x{info.RegionSize:X}");
+                            Reject(cursor, "placeholder-claim-failed");
+                            return 0;
+                        }
+
+                        _fixedGranuleReservationBases.Add(cursor);
+                        newReservations.Add(cursor);
+                        trusted = true;
+                    }
+
                     if (!trusted && cursor < requestEnd && segmentEnd > requestStart)
                     {
                         Reject(cursor, $"foreign {info.State} allocBase=0x{info.AllocationBase:X16} prot=0x{info.RawProtection:X}");
@@ -759,6 +819,121 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         return false;
+    }
+
+    public bool TryMapSharedDirect(ulong address, ulong size, ulong physicalOffset, bool executable)
+    {
+        if (!GuestSharedBacking.IsSupported || size == 0)
+        {
+            return false;
+        }
+
+        var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+        _gate.EnterWriteLock();
+        try
+        {
+            if (!GuestSharedBacking.TryMap(address, size, physicalOffset, protection))
+            {
+                return false;
+            }
+
+            RemoveRegionRangeLocked(address, size);
+            InsertRegionSorted(new MemoryRegion
+            {
+                VirtualAddress = address,
+                Size = size,
+                IsExecutable = executable,
+                // Views map reserved: their pages commit on first touch, through
+                // the same path as any other lazily committed guest range.
+                IsReservedOnly = true,
+                Protection = protection
+            });
+            Interlocked.Increment(ref _mappingGeneration);
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+
+        TraceVmem($"Mapped shared direct range: 0x{address:X16} + 0x{size:X} at physical 0x{physicalOffset:X}");
+        return true;
+    }
+
+    public bool TryUnmapShared(ulong address, ulong size)
+    {
+        if (!GuestSharedBacking.IsSupported || size == 0)
+        {
+            return false;
+        }
+
+        _gate.EnterWriteLock();
+        try
+        {
+            if (!GuestSharedBacking.TryUnmap(address, size))
+            {
+                return false;
+            }
+
+            // Only the unmapped span loses its bookkeeping; a view this call cut
+            // in half keeps its surviving pieces, and they are outside this range.
+            RemoveRegionRangeLocked(address, size);
+            Interlocked.Increment(ref _mappingGeneration);
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+
+        TraceVmem($"Unmapped shared range: 0x{address:X16} + 0x{size:X}");
+        return true;
+    }
+
+    /// <summary>
+    /// Drops the tracked regions covering a range, trimming the ones that only
+    /// overlap it so a partial unmap leaves its surviving pieces described.
+    /// </summary>
+    private void RemoveRegionRangeLocked(ulong address, ulong size)
+    {
+        var end = address + size;
+        for (var index = _regions.Count - 1; index >= 0; index--)
+        {
+            var region = _regions[index];
+            var regionEnd = region.VirtualAddress + region.Size;
+            if (regionEnd <= address || region.VirtualAddress >= end)
+            {
+                continue;
+            }
+
+            if (region.VirtualAddress >= address && regionEnd <= end)
+            {
+                _regions.RemoveAt(index);
+                continue;
+            }
+
+            if (region.VirtualAddress < address && regionEnd > end)
+            {
+                _regions.Insert(index + 1, new MemoryRegion
+                {
+                    VirtualAddress = end,
+                    Size = regionEnd - end,
+                    IsExecutable = region.IsExecutable,
+                    IsReservedOnly = region.IsReservedOnly,
+                    Protection = region.Protection
+                });
+                region.Size = address - region.VirtualAddress;
+                continue;
+            }
+
+            if (region.VirtualAddress < address)
+            {
+                region.Size = address - region.VirtualAddress;
+            }
+            else
+            {
+                region.Size = regionEnd - end;
+                region.VirtualAddress = end;
+            }
+        }
     }
 
     public bool TryAllocateAtOrAbove(
@@ -1019,6 +1194,14 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     var freedBases = new HashSet<ulong>();
                     foreach (var region in _regions)
                     {
+                        // A shared view is not an allocation Free can release; detach
+                        // it so its address goes back to the reservation instead of
+                        // staying mapped into the pool after the guest is gone.
+                        if (GuestSharedBacking.TryUnmap(region.VirtualAddress, region.Size))
+                        {
+                            continue;
+                        }
+
                         if (freedBases.Add(region.VirtualAddress))
                         {
                             _hostMemory.Free(region.VirtualAddress);
@@ -1200,10 +1383,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     public bool TryRead(ulong virtualAddress, Span<byte> destination)
     {
         var requiresExclusiveAccess = false;
+        var spansRegions = false;
         _gate.EnterReadLock();
         try
         {
             var region = FindRegion(virtualAddress, (ulong)destination.Length);
+            spansRegions = region is null && destination.Length > 1;
             if (region is not null &&
                 TryResolveRegionOffset(
                     virtualAddress,
@@ -1243,6 +1428,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         finally
         {
             _gate.ExitReadLock();
+        }
+
+        if (spansRegions)
+        {
+            return TryReadAcrossRegions(virtualAddress, destination);
         }
 
         if (!requiresExclusiveAccess)
@@ -1314,10 +1504,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
 
         var requiresExclusiveAccess = false;
+        var spansRegions = false;
         _gate.EnterReadLock();
         try
         {
             var region = FindRegion(virtualAddress, (ulong)source.Length);
+            spansRegions = region is null && source.Length > 1;
             if (region is not null &&
                 TryResolveRegionOffset(
                     virtualAddress,
@@ -1360,6 +1552,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _gate.ExitReadLock();
         }
 
+        if (spansRegions)
+        {
+            return TryWriteAcrossRegions(virtualAddress, source);
+        }
+
         if (!requiresExclusiveAccess)
         {
             return false;
@@ -1373,6 +1570,65 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         finally
         {
             _gate.ExitWriteLock();
+        }
+    }
+
+    // A span running from one tracked region into the next is valid guest
+    // memory — two adjacent mappings — but a region only resolves spans it
+    // contains. Adjacent private regions used to hide this by merging; shared
+    // direct views are tracked separately, so serve such a span piece by piece.
+    // Any gap between the pieces still fails the whole access.
+    private bool TryReadAcrossRegions(ulong address, Span<byte> destination)
+    {
+        var done = 0;
+        while (done < destination.Length)
+        {
+            var piece = GetPieceInContainingRegion(address + (ulong)done, destination.Length - done);
+            // A first piece covering the whole span means one region holds it and
+            // the access failed for another reason; retrying would recurse.
+            if (piece == 0 || piece == destination.Length ||
+                !TryRead(address + (ulong)done, destination.Slice(done, piece)))
+            {
+                return false;
+            }
+
+            done += piece;
+        }
+
+        return true;
+    }
+
+    private bool TryWriteAcrossRegions(ulong address, ReadOnlySpan<byte> source)
+    {
+        var done = 0;
+        while (done < source.Length)
+        {
+            var piece = GetPieceInContainingRegion(address + (ulong)done, source.Length - done);
+            if (piece == 0 || piece == source.Length ||
+                !TryWrite(address + (ulong)done, source.Slice(done, piece)))
+            {
+                return false;
+            }
+
+            done += piece;
+        }
+
+        return true;
+    }
+
+    private int GetPieceInContainingRegion(ulong address, int remaining)
+    {
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(address, 1);
+            return region is null
+                ? 0
+                : (int)Math.Min((ulong)remaining, region.VirtualAddress + region.Size - address);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
         }
     }
 

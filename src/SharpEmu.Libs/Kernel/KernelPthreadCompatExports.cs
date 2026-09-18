@@ -39,6 +39,19 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_FASTPATH"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    // Condition variables are usually stack- or heap-allocated, so their addresses
+    // change between boots and cannot be named in advance. The guest call site is
+    // fixed in the title's image, so filter on the caller's return address: it
+    // traces one wait/signal pair (an event object, a queue) without the volume of
+    // SHARPEMU_LOG_PTHREAD_CONDS.
+    private static readonly HashSet<ulong>? _tracePthreadCondSites = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_SITE"));
+    // A signaled waiter that cannot re-acquire its mutex at wake time turns out to
+    // be ordinary churn (measured: 124,525 waiters, each logging once, across the
+    // engine's own threads), so it stays opt-in rather than a standing warning.
+    private static readonly bool _tracePthreadCondWake =
+        _tracePthreads ||
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_WAKE"), "1", StringComparison.Ordinal);
     private static long _nextSynchronizationWaiterId;
     private static int _pthreadFastPathTraceWritten;
     private static readonly ConcurrentDictionary<ulong, byte> _pthreadFastPathBusyTraced = new();
@@ -148,6 +161,9 @@ public static class KernelPthreadCompatExports
         public LinkedListNode<PthreadCondWaiter>? Node { get; set; }
         public PthreadMutexWaiter? MutexWaiter { get; set; }
         public Timer? TimeoutTimer { get; set; }
+        public ulong CondAddress { get; init; }
+        public ulong MutexAddress { get; init; }
+        public int UngrantedWakeTraceCount;
         // 0 = waiting, 1 = signaled, 2 = timed out.
         public int CompletionState { get; set; }
     }
@@ -505,6 +521,20 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: true);
+
+    // Wakes the one waiter named in rsi. GT7 creates its delay-load thread and
+    // then hands it to this call; leaving it unresolved returns without signalling,
+    // so that thread never wakes and boot stalls on the splash. Broadcasting is a
+    // safe over-approximation - a condition variable's waiters must re-check their
+    // predicate on wake - and it guarantees the named thread is among those woken.
+    // ponytail: broadcast rather than matching rsi against the waiter queue; target
+    // it by thread handle if a thundering herd ever shows up in a profile.
+    [SysAbiExport(
+        Nid = "o69RpYO-Mu0",
+        ExportName = "scePthreadCondSignalto",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadCondSignalto(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: true);
 
     [SysAbiExport(
         Nid = "Op8TBGY5KHg",
@@ -967,7 +997,7 @@ public static class KernelPthreadCompatExports
         if (canCooperativelyBlock && waiter is not null &&
             GuestThreadExecution.RequestCurrentThreadBlock(
                 ctx,
-                "pthread_mutex_lock",
+                $"pthread_mutex_lock owner={KernelPthreadState.DescribeThreadHandle(state.OwnerThreadId)} waiters={state.QueuedWaiterCount}",
                 waiter.WakeKey,
                 () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
                 () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
@@ -1575,6 +1605,8 @@ public static class KernelPthreadCompatExports
         var waiter = new PthreadCondWaiter
         {
             ThreadId = currentThreadId,
+            CondAddress = condAddress,
+            MutexAddress = mutexAddress,
             MutexState = mutexState,
             Cooperative = cooperative,
             PosixErrors = posixErrors,
@@ -1587,7 +1619,31 @@ public static class KernelPthreadCompatExports
         {
             waiter.Node = state.WaiterQueue.AddLast(waiter);
             state.Waiters++;
+            if (SyncTraceRing.TracesCond(condAddress))
+            {
+                SyncTraceRing.Record(
+                    SyncTraceRing.SyncEvent.CondWaitEnqueue,
+                    condAddress,
+                    (ulong)state.Waiters,
+                    cooperative ? 1UL : 0UL);
+            }
+
+            if (_tracePthreadConds &&
+                ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var condWaitCallerRet))
+            {
+                // Names the guest call site, which the cond address alone does not:
+                // stack-allocated condvars move, and the title's main thread is not a
+                // registered guest thread so no snapshot or sampler covers it.
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] pthread_cond_wait-site: cond=0x{condAddress:X16} ret=0x{condWaitCallerRet:X16}");
+            }
+
             TracePthreadCond("wait-enter", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            TracePthreadCondSite(
+                ctx,
+                "wait",
+                condAddress,
+                $"mutex=0x{mutexAddress:X16} waiters={state.Waiters} timed={timed}");
 
             var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
             if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
@@ -1693,7 +1749,23 @@ public static class KernelPthreadCompatExports
                 node = next;
             }
 
+            if (SyncTraceRing.TracesCond(condAddress))
+            {
+                // The woke count against the queue that is still there is what
+                // separates a lost wake-up from a signal nobody was waiting for.
+                SyncTraceRing.Record(
+                    SyncTraceRing.SyncEvent.CondSignal,
+                    condAddress,
+                    ((ulong)(uint)(completedWaiters?.Count ?? 0) << 32) | (uint)state.Waiters,
+                    ((ulong)state.SignalEpoch << 1) | (broadcast ? 1UL : 0UL));
+            }
+
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            TracePthreadCondSite(
+                ctx,
+                broadcast ? "broadcast" : "signal",
+                condAddress,
+                $"woke={(completedWaiters?.Count ?? 0)} still_queued={state.Waiters}");
         }
 
         if (completedWaiters is not null)
@@ -1928,6 +2000,15 @@ public static class KernelPthreadCompatExports
         }
 
         waiter.CompletionState = timedOut ? 2 : 1;
+        if (SyncTraceRing.TracesCond(waiter.CondAddress))
+        {
+            SyncTraceRing.Record(
+                SyncTraceRing.SyncEvent.CondComplete,
+                waiter.CondAddress,
+                waiter.ThreadId,
+                timedOut ? 2UL : 1UL);
+        }
+
         RemoveCondWaiterLocked(state, waiter);
         waiter.TimeoutTimer?.Dispose();
         waiter.TimeoutTimer = null;
@@ -1980,10 +2061,36 @@ public static class KernelPthreadCompatExports
             return false;
         }
 
+        bool granted;
+        ulong owner;
+        int queued;
         lock (waiter.MutexState.SyncRoot)
         {
-            return TryGrantMutexWaiterLocked(waiter.MutexState, mutexWaiter);
+            granted = TryGrantMutexWaiterLocked(waiter.MutexState, mutexWaiter);
+            owner = waiter.MutexState.OwnerThreadId;
+            queued = waiter.MutexState.QueuedWaiterCount;
         }
+
+        if (!granted)
+        {
+            // The waiter was signaled but cannot resume: its mutex is held by
+            // someone else. A later unlock hands the mutex to the queue head and
+            // wakes this same key, so this is normally transient — but it is the
+            // one state a thread snapshot cannot distinguish from "never
+            // signaled", both showing block=pthread_cond_wait. Rate-limited so a
+            // busy lock cannot flood the log.
+            var traceCount = Interlocked.Increment(ref waiter.UngrantedWakeTraceCount);
+            if (_tracePthreadCondWake && (traceCount <= 4 || (traceCount & (traceCount - 1)) == 0))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] pthread_cond_wake_ungranted count={traceCount} " +
+                    $"cond=0x{waiter.CondAddress:X16} mutex=0x{waiter.MutexAddress:X16} " +
+                    $"thread={KernelPthreadState.DescribeThreadHandle(waiter.ThreadId)} " +
+                    $"owner={KernelPthreadState.DescribeThreadHandle(owner)} waiters={queued}");
+            }
+        }
+
+        return granted;
     }
 
     private static int CompleteBlockedCondWait(
@@ -2001,6 +2108,15 @@ public static class KernelPthreadCompatExports
                     ? CondTimedOutResult(waiter)
                     : (int)OrbisGen2Result.ORBIS_GEN2_OK)
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+        if (SyncTraceRing.TracesCond(condAddress))
+        {
+            SyncTraceRing.Record(
+                SyncTraceRing.SyncEvent.CondWaitExit,
+                condAddress,
+                waiter.ThreadId,
+                (ulong)(uint)result);
+        }
+
         TracePthreadCond(
             waiter.CompletionState == 2 ? "wait-resume-timeout" : "wait-resume",
             condAddress,
@@ -2019,9 +2135,21 @@ public static class KernelPthreadCompatExports
 
     private static void WakeCooperativeWaiter(PthreadCondWaiter waiter)
     {
-        if (waiter.Cooperative)
+        if (!waiter.Cooperative)
         {
-            _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(waiter.WakeKey, 1);
+            return;
+        }
+
+        var woken = GuestThreadExecution.Scheduler?.WakeBlockedThreads(waiter.WakeKey, 1) ?? 0;
+        if (SyncTraceRing.TracesCond(waiter.CondAddress))
+        {
+            // Zero here is the shape of a lost wake-up: the waiter was completed
+            // but no blocked guest thread was actually released.
+            SyncTraceRing.Record(
+                SyncTraceRing.SyncEvent.CondWake,
+                waiter.CondAddress,
+                waiter.ThreadId,
+                (ulong)(uint)woken);
         }
     }
 
@@ -2261,6 +2389,26 @@ public static class KernelPthreadCompatExports
     private static bool ShouldTracePthread()
     {
         return _tracePthreads;
+    }
+
+    private static void TracePthreadCondSite(
+        CpuContext ctx,
+        string operation,
+        ulong condAddress,
+        string detail)
+    {
+        if (_tracePthreadCondSites is null ||
+            !ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var callerRet) ||
+            !_tracePthreadCondSites.Contains(callerRet))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] pthread_cond_site_{operation}: cond=0x{condAddress:X16} " +
+            $"ret=0x{callerRet:X16} " +
+            $"thread={KernelPthreadState.DescribeThreadHandle(KernelPthreadState.GetCurrentThreadHandle())} " +
+            detail);
     }
 
     private static bool ShouldTracePthreadMutex(ulong mutexAddress, ulong resolvedAddress)

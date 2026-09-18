@@ -38,6 +38,11 @@ public static class AmprExports
         public ulong Size;
         public ulong WriteOffset;
         public ulong CommandCount;
+
+        // sceAmprAprCommandBufferReadFileGatherScatter names no file: it
+        // continues the one the buffer's last ReadFile selected. The APR calls
+        // that "gather/scatter state", and resetGatherScatterState clears it.
+        public uint? GatherScatterFileId;
     }
 
     private sealed class CachedHostFile : IDisposable
@@ -327,6 +332,7 @@ public static class AmprExports
         }
 
         PakDirectoryTracker.OnReadCompleted(ctx, fileId, destination, fileOffset, bytesRead);
+        _commandBuffers.GetOrAdd(commandBuffer, static _ => new CommandBufferState()).GatherScatterFileId = fileId;
 
         if (!AppendReadFileRecord(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead))
         {
@@ -347,6 +353,129 @@ public static class AmprExports
     {
         TraceAmpr(ctx, "measure_read_file", 0, ReadFileRecordSize, 0);
         ctx[CpuRegister.Rax] = ReadFileRecordSize;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // sce::Ampr::MeasureAprCommandSize::readFileGatherScatter(void*, size_t, size_t)
+    // and its AprCommandBuffer counterpart: a scattered read of one already
+    // selected file, used for streaming into a partially resident texture.
+    // GT7's streamer calls the measure for every 64 KiB tile it wants
+    // (destination in the PRT aperture, third argument the file offset).
+    //
+    // Leaving the measure unresolved does not merely skip a read. The caller
+    // adds the returned size into an unsigned free-space test
+    // (`bufferSize < currentOffset + commandSize + reserve`); with the
+    // sign-extended ORBIS_GEN2_ERROR_NOT_FOUND in there the sum is enormous, the
+    // test always says "full", and the emit loop submits the buffer and asks for
+    // a new one forever without ever writing the read. The streaming thread then
+    // waits on a completion event that nothing can signal.
+    //
+    // The command writes the same record as a plain ReadFile, so it measures the
+    // same. Its size is SharpEmu's record size rather than hardware's: the guest
+    // only uses it to reserve room in a buffer this backend also writes.
+    [SysAbiExport(
+        Nid = "DXmgc5op8Yw",
+        ExportName = "sceAmprMeasureCommandSizeReadFileGatherScatter",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int MeasureCommandSizeReadFileGatherScatter(CpuContext ctx)
+    {
+        TraceAmpr(ctx, "measure_read_file_gather_scatter", 0, ReadFileRecordSize, 0);
+        ctx[CpuRegister.Rax] = ReadFileRecordSize;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "BVmR1H8l+XI",
+        ExportName = "sceAmprAprCommandBufferReadFileGatherScatter",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int AprCommandBufferReadFileGatherScatter(CpuContext ctx)
+    {
+        // Same shape as sceAmprAprCommandBufferReadFile minus the file id, which
+        // shifts the remaining arguments down a register each. GT7's wrapper at
+        // 0x801923630 makes the layout explicit before tail-jumping here:
+        //   mov r9,rcx / mov r8,rdx / mov rcx,rsi / lea rsi,[rdi+0x18] / lea rdx,[rdi+0x20]
+        // so rsi and rdx are the visible command-buffer pointers, not arguments.
+        var commandBuffer = ctx[CpuRegister.Rdi];
+        var destination = ctx[CpuRegister.Rcx];
+        var size = ctx[CpuRegister.R8];
+        var fileOffset = ctx[CpuRegister.R9];
+
+        if (commandBuffer == 0 || (destination == 0 && size != 0))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!_commandBuffers.TryGetValue(commandBuffer, out var state) ||
+            state.GatherScatterFileId is not { } fileId)
+        {
+            // No file selected on this buffer. The caller is expected to issue a
+            // ReadFile first, so this is a guest sequencing error, not a missing
+            // file.
+            TraceAmpr(ctx, "gather_scatter_no_file", commandBuffer, destination, size);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!AmprFileRegistry.TryGetHostPath(fileId, out var hostPath))
+        {
+            TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead: 0, hostPath, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        var result = TryReadFileToGuestMemory(ctx, hostPath, fileOffset, destination, size, out var bytesRead);
+        if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead, hostPath, result);
+            return result;
+        }
+
+        PakDirectoryTracker.OnReadCompleted(ctx, fileId, destination, fileOffset, bytesRead);
+
+        if (!AppendReadFileRecord(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead, hostPath, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // resetGatherScatterState() drops the selected file; it writes no command,
+    // so it measures as nothing.
+    [SysAbiExport(
+        Nid = "rddQYXM0CjM",
+        ExportName = "sceAmprMeasureCommandSizeResetGatherScatterState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int MeasureCommandSizeResetGatherScatterState(CpuContext ctx)
+    {
+        TraceAmpr(ctx, "measure_reset_gather_scatter", 0, 0, 0);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "YPxkUDhgoNI",
+        ExportName = "sceAmprAprCommandBufferResetGatherScatterState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int AprCommandBufferResetGatherScatterState(CpuContext ctx)
+    {
+        var commandBuffer = ctx[CpuRegister.Rdi];
+        if (commandBuffer == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (_commandBuffers.TryGetValue(commandBuffer, out var state))
+        {
+            state.GatherScatterFileId = null;
+        }
+
+        TraceAmpr(ctx, "reset_gather_scatter", commandBuffer, 0, 0);
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

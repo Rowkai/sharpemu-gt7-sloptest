@@ -30,6 +30,9 @@ public static class AvPlayerExports
     private const int Gen5StreamInfoSize = 32;
     private const int StreamInfoExSize = 104;
     private const int MaxGuestPathLength = 4096;
+    internal const int FileReplacementChunkBytes = 1 << 20;
+    private const ulong MaxFileReplacementBytes = 1UL << 31;
+    private static readonly object ExtractGate = new();
     private const int VideoPitchAlignment = 256;
     private static readonly object StateGate = new();
     private static readonly HashSet<string> TracedOnce = new();
@@ -241,6 +244,15 @@ public static class AvPlayerExports
         public ulong AllocateCallback { get; init; }
         public ulong EventObject { get; init; }
         public ulong EventCallback { get; init; }
+
+        // SceAvPlayerFileReplacement: titles that keep their media inside their
+        // own archives serve it through these instead of a readable path.
+        public ulong FileObject { get; init; }
+        public ulong FileOpenCallback { get; init; }
+        public ulong FileCloseCallback { get; init; }
+        public ulong FileReadOffsetCallback { get; init; }
+        public ulong FileSizeCallback { get; init; }
+        public ulong FileBuffer { get; set; }
         public string? SourcePath { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
@@ -338,6 +350,11 @@ public static class AvPlayerExports
                 AllocateCallback = TryReadUInt64(ctx, initDataAddress + 8, out var allocate) ? allocate : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 80, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 88, out var eventCallback) ? eventCallback : 0,
+                FileObject = TryReadUInt64(ctx, initDataAddress + 40, out var fileObject) ? fileObject : 0,
+                FileOpenCallback = TryReadUInt64(ctx, initDataAddress + 48, out var fileOpen) ? fileOpen : 0,
+                FileCloseCallback = TryReadUInt64(ctx, initDataAddress + 56, out var fileClose) ? fileClose : 0,
+                FileReadOffsetCallback = TryReadUInt64(ctx, initDataAddress + 64, out var fileRead) ? fileRead : 0,
+                FileSizeCallback = TryReadUInt64(ctx, initDataAddress + 72, out var fileSize) ? fileSize : 0,
             });
         }
 
@@ -395,10 +412,17 @@ public static class AvPlayerExports
                 AllocateCallback = TryReadUInt64(ctx, initDataAddress + 16, out var allocate) ? allocate : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 88, out var eventObject) ? eventObject : 0,
                 EventCallback = TryReadUInt64(ctx, initDataAddress + 96, out var eventCallback) ? eventCallback : 0,
+                FileObject = TryReadUInt64(ctx, initDataAddress + 48, out var fileObject) ? fileObject : 0,
+                FileOpenCallback = TryReadUInt64(ctx, initDataAddress + 56, out var fileOpen) ? fileOpen : 0,
+                FileCloseCallback = TryReadUInt64(ctx, initDataAddress + 64, out var fileClose) ? fileClose : 0,
+                FileReadOffsetCallback = TryReadUInt64(ctx, initDataAddress + 72, out var fileRead) ? fileRead : 0,
+                FileSizeCallback = TryReadUInt64(ctx, initDataAddress + 80, out var fileSize) ? fileSize : 0,
             });
         }
 
-        Trace($"init_ex handle=0x{handle:X16} alloc_texture=0x{Players[handle].AllocateTextureCallback:X16}");
+        Trace(
+            $"init_ex handle=0x{handle:X16} alloc_texture=0x{Players[handle].AllocateTextureCallback:X16} " +
+            $"file_open=0x{Players[handle].FileOpenCallback:X16}");
         return SetReturn(ctx, 0);
     }
 
@@ -441,7 +465,7 @@ public static class AvPlayerExports
             return SetReturn(ctx, InvalidParameters);
         }
 
-        return AddSource(ctx, path);
+        return AddSource(ctx, path, ctx[CpuRegister.Rsi]);
     }
 
     [SysAbiExport(
@@ -462,7 +486,7 @@ public static class AvPlayerExports
             return SetReturn(ctx, InvalidParameters);
         }
 
-        return AddSource(ctx, path.TrimEnd('\0'));
+        return AddSource(ctx, path.TrimEnd('\0'), pathAddress);
     }
 
     [SysAbiExport(
@@ -932,7 +956,7 @@ public static class AvPlayerExports
         }
     }
 
-    private static int AddSource(CpuContext ctx, string guestPath)
+    private static int AddSource(CpuContext ctx, string guestPath, ulong guestPathAddress)
     {
         PlayerState player;
         bool autoStart;
@@ -942,9 +966,22 @@ public static class AvPlayerExports
             {
                 return SetReturn(ctx, InvalidParameters);
             }
-            player = foundPlayer;
 
-            var hostPath = ResolveGuestPath(guestPath);
+            player = foundPlayer;
+        }
+
+        // File replacement callbacks are guest code, so they run before the
+        // state lock is taken: they re-enter AvPlayer on other guest threads.
+        var resolvedPath = ResolveGuestPath(guestPath);
+        if ((resolvedPath is null || !File.Exists(resolvedPath)) &&
+            TryExtractGuestSource(ctx, player, guestPath, guestPathAddress, out var extractedPath))
+        {
+            resolvedPath = extractedPath;
+        }
+
+        lock (StateGate)
+        {
+            var hostPath = resolvedPath;
             if (hostPath is null ||
                 !ProbeVideo(
                     hostPath,
@@ -977,6 +1014,237 @@ public static class AvPlayerExports
             NotifyEvent(ctx, player, 3); // StatePlay
         }
         return SetReturn(ctx, 0);
+    }
+
+    /// <summary>
+    /// Copies a source the host cannot open to a temp file by reading it back
+    /// through the title's own SceAvPlayerFileReplacement callbacks.
+    /// </summary>
+    private static bool TryExtractGuestSource(
+        CpuContext ctx,
+        PlayerState player,
+        string guestPath,
+        ulong guestPathAddress,
+        out string? hostPath)
+    {
+        hostPath = null;
+        if (player.FileOpenCallback == 0 ||
+            player.FileReadOffsetCallback == 0 ||
+            player.FileSizeCallback == 0 ||
+            guestPathAddress == 0)
+        {
+            return false;
+        }
+
+        if (player.FileBuffer == 0)
+        {
+            if (!KernelMemoryCompatExports.TryAllocateHleData(
+                    ctx,
+                    FileReplacementChunkBytes,
+                    0x100,
+                    out var buffer))
+            {
+                return false;
+            }
+
+            player.FileBuffer = buffer;
+        }
+
+        var directory = Path.Combine(Path.GetTempPath(), "SharpEmu", "avplayer");
+        var name = Convert.ToHexString(
+            System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(guestPath)));
+        var target = Path.Combine(directory, name + Path.GetExtension(guestPath));
+        // ponytail: one extraction at a time; per-source locks if a title ever
+        // opens several movies concurrently.
+        lock (ExtractGate)
+        {
+            Stream? destination = null;
+            string? error;
+            try
+            {
+                Directory.CreateDirectory(directory);
+                destination = File.Create(target);
+                if (TryReadGuestSourceThroughCallbacks(
+                        ctx,
+                        player.FileObject,
+                        player.FileOpenCallback,
+                        player.FileCloseCallback,
+                        player.FileReadOffsetCallback,
+                        player.FileSizeCallback,
+                        guestPathAddress,
+                        player.FileBuffer,
+                        FileReplacementChunkBytes,
+                        destination,
+                        out error))
+                {
+                    destination.Dispose();
+                    destination = null;
+                    hostPath = target;
+                    Trace($"file_replacement guest='{guestPath}' host='{target}'");
+                    return true;
+                }
+            }
+            catch (IOException e)
+            {
+                error = e.Message;
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                error = e.Message;
+            }
+            finally
+            {
+                destination?.Dispose();
+            }
+
+            Console.Error.WriteLine(
+                $"[AVPLAYER][WARN] File replacement could not read '{guestPath}': {error ?? "unknown error"}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Drives open / size / readOffset / close on the guest and writes the
+    /// bytes to <paramref name="destination"/>. The read buffer is guest memory
+    /// the callback fills; every call is a guest function call.
+    /// </summary>
+    internal static bool TryReadGuestSourceThroughCallbacks(
+        CpuContext ctx,
+        ulong fileObject,
+        ulong openCallback,
+        ulong closeCallback,
+        ulong readOffsetCallback,
+        ulong sizeCallback,
+        ulong guestPathAddress,
+        ulong bufferAddress,
+        int bufferLength,
+        Stream destination,
+        out string? error)
+    {
+        error = null;
+        var scheduler = GuestThreadExecution.Scheduler;
+        if (scheduler is null)
+        {
+            error = "scheduler unavailable";
+            return false;
+        }
+
+        if (!scheduler.TryCallGuestFunction(
+                ctx,
+                openCallback,
+                fileObject,
+                guestPathAddress,
+                0,
+                0,
+                0,
+                0,
+                "avplayer_file_open",
+                out var openResult,
+                out error))
+        {
+            return false;
+        }
+
+        if (unchecked((int)openResult) < 0)
+        {
+            error = $"open returned {unchecked((int)openResult)}";
+            return false;
+        }
+
+        try
+        {
+            if (!scheduler.TryCallGuestFunction(
+                    ctx,
+                    sizeCallback,
+                    fileObject,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "avplayer_file_size",
+                    out var size,
+                    out error))
+            {
+                return false;
+            }
+
+            Trace(
+                $"file_replacement open={unchecked((int)openResult)} size={size} " +
+                $"object=0x{fileObject:X16} open_cb=0x{openCallback:X16} size_cb=0x{sizeCallback:X16}");
+            if (size == 0 || size > MaxFileReplacementBytes)
+            {
+                error = $"implausible source size {size}";
+                return false;
+            }
+
+            var chunk = new byte[bufferLength];
+            ulong position = 0;
+            while (position < size)
+            {
+                var length = (uint)Math.Min((ulong)bufferLength, size - position);
+                if (!scheduler.TryCallGuestFunction(
+                        ctx,
+                        readOffsetCallback,
+                        fileObject,
+                        bufferAddress,
+                        position,
+                        length,
+                        0,
+                        0,
+                        "avplayer_file_read",
+                        out var read,
+                        out error))
+                {
+                    return false;
+                }
+
+                var readCount = Math.Min(unchecked((int)read), (int)length);
+                if (readCount <= 0)
+                {
+                    error = $"readOffset returned {unchecked((int)read)} at {position}";
+                    return false;
+                }
+
+                if (!ctx.Memory.TryRead(bufferAddress, chunk.AsSpan(0, readCount)))
+                {
+                    error = $"guest read buffer 0x{bufferAddress:X16} unreadable";
+                    return false;
+                }
+
+                destination.Write(chunk, 0, readCount);
+                position += (ulong)readCount;
+            }
+
+            return true;
+        }
+        finally
+        {
+            // TEMP diagnostic, revert before commit: keep the guest file object alive for a live memory read.
+            if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_HOLD_BEFORE_CLOSE_MS"), out var holdMs) && holdMs > 0)
+            {
+                System.Threading.Thread.Sleep(1000);
+                scheduler.TryCallGuestFunction(ctx, sizeCallback, fileObject, 0, 0, 0, 0, 0, "avplayer_file_size_retry", out var retrySize, out var retryError);
+                Console.Error.WriteLine($"[AVPLAYER][WARN] hold_before_close object=0x{fileObject:X16} ms={holdMs} retry_size={retrySize} retry_error={retryError ?? "none"}");
+                System.Threading.Thread.Sleep(holdMs);
+            }
+
+            if (closeCallback != 0)
+            {
+                scheduler.TryCallGuestFunction(
+                    ctx,
+                    closeCallback,
+                    fileObject,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "avplayer_file_close",
+                    out _,
+                    out _);
+            }
+        }
     }
 
     private static int GetVideoData(CpuContext ctx, bool extended)

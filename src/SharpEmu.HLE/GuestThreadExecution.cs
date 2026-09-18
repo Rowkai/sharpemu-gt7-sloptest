@@ -98,6 +98,24 @@ public interface IGuestThreadScheduler
         out ulong returnValue,
         out string? error);
 
+    /// <summary>
+    /// Four-argument form. Callbacks a title installs in library init data can
+    /// take more than three arguments: libSceAvPlayer's file replacement
+    /// readOffset(object, buffer, position, length) is one.
+    /// </summary>
+    bool TryCallGuestFunction(
+        CpuContext callerContext,
+        ulong entryPoint,
+        ulong arg0,
+        ulong arg1,
+        ulong arg2,
+        ulong arg3,
+        ulong stackAddress,
+        ulong stackSize,
+        string reason,
+        out ulong returnValue,
+        out string? error);
+
     bool TryCallGuestContinuation(
         CpuContext callerContext,
         GuestCpuContinuation continuation,

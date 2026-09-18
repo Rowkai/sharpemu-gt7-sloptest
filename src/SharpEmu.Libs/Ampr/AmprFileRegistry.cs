@@ -38,7 +38,7 @@ internal static class AmprFileRegistry
 
     public static bool TryGetHostPath(uint id, out string hostPath)
     {
-        return _hostPathsById.TryGetValue(id, out hostPath!);
+        return _hostPathsById.TryGetValue(MaskId(id), out hostPath!);
     }
 
     /// <summary>Test hook: wipe registry state between cases.</summary>
@@ -255,14 +255,21 @@ internal static class AmprFileRegistry
         Publish(OffsetBasis, relative, hostPath);
     }
 
+    /// <summary>
+    /// APR ids travel through guest code that keeps them in signed 32-bit
+    /// slots, so an id with bit 31 set reads back as a negative handle and the
+    /// title treats the open as failed. Keep every published id non-negative.
+    /// </summary>
+    internal static uint MaskId(uint id) => id & 0x7FFFFFFFu;
+
     private static void Publish(uint hash, string relative, string hostPath)
     {
-        _hostPathsById[FnvContinueUtf8(hash, relative)] = hostPath;
+        _hostPathsById[MaskId(FnvContinueUtf8(hash, relative))] = hostPath;
     }
 
     internal static uint ComputeFileId(string guestPath)
     {
-        return FnvContinueUtf8(OffsetBasis, guestPath);
+        return MaskId(FnvContinueUtf8(OffsetBasis, guestPath));
     }
 
     internal static IEnumerable<string> EnumerateApp0PathAliases(string guestPath)
@@ -427,10 +434,10 @@ internal static class AmprFileRegistry
                             ? normalizedRoot + entry.Relative.Replace('/', Path.DirectorySeparatorChar)
                             : normalizedRoot + Path.DirectorySeparatorChar +
                               entry.Relative.Replace('/', Path.DirectorySeparatorChar);
-                        _hostPathsById[entry.Id0] = hostPath;
-                        _hostPathsById[entry.Id1] = hostPath;
-                        _hostPathsById[entry.Id2] = hostPath;
-                        _hostPathsById[entry.Id3] = hostPath;
+                        _hostPathsById[MaskId(entry.Id0)] = hostPath;
+                        _hostPathsById[MaskId(entry.Id1)] = hostPath;
+                        _hostPathsById[MaskId(entry.Id2)] = hostPath;
+                        _hostPathsById[MaskId(entry.Id3)] = hostPath;
                     });
             }
             else
@@ -542,10 +549,10 @@ internal static class AmprFileRegistry
         var dollar = FnvContinueUtf8(
             FnvContinueAscii(FnvContinueAscii(OffsetBasis, (byte)'$'), (byte)'/'),
             relative);
-        app0Slash = FnvContinueUtf8(FnvContinueAsciiPrefix(OffsetBasis, "/app0/"u8), relative);
-        app0 = FnvContinueUtf8(FnvContinueAsciiPrefix(OffsetBasis, "app0/"u8), relative);
-        bare = FnvContinueUtf8(OffsetBasis, relative);
-        return dollar;
+        app0Slash = MaskId(FnvContinueUtf8(FnvContinueAsciiPrefix(OffsetBasis, "/app0/"u8), relative));
+        app0 = MaskId(FnvContinueUtf8(FnvContinueAsciiPrefix(OffsetBasis, "app0/"u8), relative));
+        bare = MaskId(FnvContinueUtf8(OffsetBasis, relative));
+        return MaskId(dollar);
     }
 
     /// <summary>
