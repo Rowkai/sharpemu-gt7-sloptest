@@ -34,8 +34,8 @@ to the car carousel.
 | :-------------------------------------: | :----------------------------------------: |
 | ![](./gt7-screens/01-first-present.png) |  ![](./gt7-screens/02-dialogs-cleared.png) |
 | ![](./gt7-screens/03-wizard-step01.png) |   ![](./gt7-screens/04-wizard-step02.png)  |
-| ![](./gt7-screens/05-wizard-step03.png) |     ![](./gt7-screens/06-carousel.png)     |
-|   ![](./gt7-screens/07-first-tile.png)  | ![](./gt7-screens/08-after-select-10s.png) |
+| ![](./gt7-screens/05-wizard-step03.png) | ![](./gt7-screens/08-after-select-10s.png) |
+
 
 
 
