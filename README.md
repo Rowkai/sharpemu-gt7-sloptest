@@ -3,25 +3,7 @@ Copyright (C) 2026 SharpEmu Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# SharpEmu
-
-<p align="center">
-  <img src="./assets/images/logo.png" width=30% height=30% />
-</p>
-
-<p align="center">
-  An experimental PlayStation 5 emulator for Windows, Linux and macOS.  
-</p>
-
----
-
-<p align="center">
-  <a href="#support">
-    <img src="https://img.shields.io/badge/Support-GitHub%20Sponsors%20%26%20Crypto-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Support SharpEmu">
-  </a>
-</p>
-
----
+# SharpEmu - GT7 test
 
 ## This is purely an AI slop test to see how far GPT/Claude could get. Most of this is likely crap.
 
